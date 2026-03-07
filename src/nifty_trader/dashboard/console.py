@@ -29,6 +29,15 @@ class Dashboard:
         self._system_status: str = "Starting"
         self._position_info: str = "No position"
         self._last_update: str = ""
+        # VENOM enhancements
+        self._vix: float = 0.0
+        self._vix_mode: str = ""
+        self._ohlc_signal: str = ""
+        self._monthly_pnl: float = 0.0
+        self._weekly_pnl: float = 0.0
+        self._win_rate: float = 0.0
+        self._avg_wl_ratio: float = 0.0
+        self._trail_status: str = ""
 
     def update(
         self,
@@ -38,6 +47,14 @@ class Dashboard:
         trade_count: int = 0,
         signals_text: str = "",
         system_status: str = "",
+        vix: float = 0.0,
+        vix_mode: str = "",
+        ohlc_signal: str = "",
+        monthly_pnl: float = 0.0,
+        weekly_pnl: float = 0.0,
+        win_rate: float = 0.0,
+        avg_wl_ratio: float = 0.0,
+        trail_status: str = "",
     ):
         self._spot_price = nifty_price
         self._daily_pnl = daily_pnl
@@ -47,6 +64,15 @@ class Dashboard:
         if system_status:
             self._system_status = system_status
         self._last_update = datetime.now().strftime("%H:%M:%S")
+        # VENOM params
+        self._vix = vix
+        self._vix_mode = vix_mode
+        self._ohlc_signal = ohlc_signal
+        self._monthly_pnl = monthly_pnl
+        self._weekly_pnl = weekly_pnl
+        self._win_rate = win_rate
+        self._avg_wl_ratio = avg_wl_ratio
+        self._trail_status = trail_status
 
         if fsm.has_position:
             ctx = fsm.ctx
@@ -71,12 +97,17 @@ class Dashboard:
         layout.split_column(
             Layout(self._header_panel(), size=3),
             Layout(name="body", ratio=1),
+            Layout(name="bottom", size=8),
             Layout(self._footer_panel(), size=3),
         )
         layout["body"].split_row(
             Layout(self._market_panel(), ratio=1),
             Layout(self._position_panel(), ratio=1),
             Layout(self._signals_panel(), ratio=1),
+        )
+        layout["bottom"].split_row(
+            Layout(self._signal_detail_panel(), ratio=1),
+            Layout(self._monthly_stats_panel(), ratio=1),
         )
         return layout
 
@@ -103,6 +134,29 @@ class Dashboard:
 
     def _signals_panel(self) -> Panel:
         return Panel(self._signals_text, title="Signals", border_style="magenta")
+
+    def _signal_detail_panel(self) -> Panel:
+        table = Table(show_header=False, expand=True)
+        table.add_column("Field", style="cyan")
+        table.add_column("Value")
+        vix_color = "red" if self._vix > 20 else "green"
+        table.add_row("VIX", f"[{vix_color}]{self._vix:.2f}[/{vix_color}]")
+        table.add_row("VIX Mode", self._vix_mode or "-")
+        table.add_row("O=H/O=L", self._ohlc_signal or "-")
+        table.add_row("Trail", self._trail_status or "-")
+        return Panel(table, title="Signal Detail", border_style="cyan")
+
+    def _monthly_stats_panel(self) -> Panel:
+        table = Table(show_header=False, expand=True)
+        table.add_column("Field", style="cyan")
+        table.add_column("Value")
+        mtd_color = "green" if self._monthly_pnl >= 0 else "red"
+        wtd_color = "green" if self._weekly_pnl >= 0 else "red"
+        table.add_row("MTD P&L", f"[{mtd_color}]{self._monthly_pnl:+.2f}[/{mtd_color}]")
+        table.add_row("Weekly P&L", f"[{wtd_color}]{self._weekly_pnl:+.2f}[/{wtd_color}]")
+        table.add_row("Win Rate", f"{self._win_rate:.1f}%")
+        table.add_row("Avg W/L", f"{self._avg_wl_ratio:.2f}")
+        return Panel(table, title="Monthly Stats", border_style="blue")
 
     def _footer_panel(self) -> Panel:
         return Panel(
