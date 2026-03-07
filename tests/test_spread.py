@@ -206,6 +206,38 @@ class TestSpreadFSMLifecycle:
         assert fsm.ctx.pnl == pytest.approx(-125.0)
 
 
+class TestMCXSpreadPositionSizing:
+    """Credit spread sizing with MCX lot sizes."""
+
+    def test_gold_mini_spread(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0), lot_size=100)
+        # Gold Mini 500-point spread, ₹15 credit
+        size = mgr.compute_spread_position_size(net_credit=15.0, spread_width=500.0)
+        # max_loss_per_lot = (500 - 15) * 100 = 48500 > 2× risk (4000)
+        assert size is None
+
+    def test_gold_mini_narrow_spread(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0), lot_size=100)
+        # Narrower spread more suitable for ₹1L capital
+        size = mgr.compute_spread_position_size(net_credit=10.0, spread_width=20.0)
+        assert size is not None
+        # max_loss_per_lot = (20 - 10) * 100 = 1000
+        # max_risk = 2000
+        # lots = int(2000/1000) = 2
+        assert size.lots == 2
+        assert size.quantity == 200
+
+    def test_crude_mini_spread(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0), lot_size=10)
+        size = mgr.compute_spread_position_size(net_credit=50.0, spread_width=100.0)
+        assert size is not None
+        # max_loss_per_lot = (100 - 50) * 10 = 500
+        # max_risk = 2000
+        # lots = int(2000/500) = 4
+        assert size.lots == 4
+        assert size.quantity == 40
+
+
 class TestSpreadExitLogic:
     def test_profit_target_exit(self):
         mgr = RiskManager(RiskConfig(capital=100_000))

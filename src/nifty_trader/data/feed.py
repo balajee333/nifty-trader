@@ -53,14 +53,22 @@ class MarketFeedManager:
         return self._latest_ltp.get(security_id)
 
     def subscribe_nifty_spot(self):
-        """Subscribe to NIFTY 50 index quote."""
-        from dhanhq.marketfeed import IDX
-        self._subscriptions.append((IDX, NIFTY_SECURITY_ID, self.QUOTE))
+        """Subscribe to NIFTY 50 index quote (backward-compat wrapper)."""
+        self.subscribe_spot()
 
-    def subscribe_option(self, security_id: str):
+    def subscribe_spot(self, feed_code: int | None = None, security_id: str = NIFTY_SECURITY_ID):
+        """Subscribe to spot/index quote. feed_code: 0=IDX, 5=MCX."""
+        if feed_code is None:
+            from dhanhq.marketfeed import IDX
+            feed_code = IDX
+        self._subscriptions.append((feed_code, security_id, self.QUOTE))
+
+    def subscribe_option(self, security_id: str, feed_code: int | None = None):
         """Subscribe to an option contract for LTP."""
-        from dhanhq.marketfeed import NSE_FNO
-        self._subscriptions.append((NSE_FNO, security_id, self.QUOTE))
+        if feed_code is None:
+            from dhanhq.marketfeed import NSE_FNO
+            feed_code = NSE_FNO
+        self._subscriptions.append((feed_code, security_id, self.QUOTE))
 
     def start(self):
         """Start the WebSocket feed and polling thread."""
@@ -152,12 +160,12 @@ class MarketFeedManager:
                 if isinstance(item, dict):
                     self._process_tick(item)
 
-    def fetch_ltp_rest(self, security_id: str) -> float | None:
+    def fetch_ltp_rest(self, security_id: str, exchange_segment: str = ExchangeSegment.NSE_FNO) -> float | None:
         """Fallback REST-based LTP fetch when WebSocket is down."""
         try:
             resp = self._dhan.get_market_quote(
                 security_id=security_id,
-                exchange_segment=ExchangeSegment.NSE_FNO,
+                exchange_segment=exchange_segment,
             )
             if resp and resp.get("status") == "success":
                 data = resp.get("data", {})

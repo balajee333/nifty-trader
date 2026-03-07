@@ -1,0 +1,88 @@
+# MCX Crude Oil Mini — dedicated config for CRUDEOILM trading
+# Usage: nifty-trader --config config/mcx-crudeoilm.yaml
+
+strategy_mode: "credit_spread"
+
+instrument:
+  name: "CRUDEOILM"
+  security_id: "0"  # Run: python scripts/download_instruments.py --find CRUDEOILM
+  exchange_segment: "MCX_COMM"
+  spot_exchange_segment: "MCX_COMM"
+  instrument_type: "FUTCOM"
+  lot_size: 10
+  feed_code: 5
+  market_open: "09:00"
+  market_close: "23:30"
+
+strategy:
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  rsi_bullish_entry: 35
+  rsi_bearish_entry: 65
+  rsi_oversold: 30
+  rsi_overbought: 70
+  vwap_confirm_candles: 3
+  volume_spike_multiplier: 1.5
+  volume_sma_period: 20
+  level_proximity_pct: 0.3
+  confluence_min_score: 2.0
+  signal_weights:
+    ema: 1.0
+    vwap: 0.8
+    rsi: 0.7
+    volume: 0.5
+    levels: 0.5
+
+risk:
+  capital: 100000
+  risk_per_trade_pct: 2.0
+  daily_loss_limit_pct: 3.0
+  max_positions: 1
+  sl_pct: 35.0
+  reward_risk_ratio: 2.0
+  trailing_breakeven_pct: 50.0
+  trailing_advance_pct: 75.0
+  time_stop_minutes: 90  # Longer for MCX sessions (14.5 hrs)
+  max_single_loss_pct: 5.0
+
+strike:
+  delta_min: 0.30
+  delta_max: 0.50
+  delta_target: 0.40
+  iv_rank_max: 80.0
+  min_volume: 100
+  min_oi: 1000
+  max_spread_pct: 5.0
+
+spread:
+  short_delta_min: 0.15
+  short_delta_max: 0.30
+  short_delta_target: 0.20
+  spread_width_points: 100
+  min_credit: 10.0
+  profit_target_pct: 50.0
+  loss_threshold_multiplier: 2.0
+  min_volume: 100
+  min_oi: 1000
+  max_spread_pct: 5.0
+  iv_rank_min: 25.0
+
+timing:
+  scan_start: "09:20"
+  no_entry_after: "22:00"
+  force_exit: "23:15"
+  reconcile: "23:35"
+  candle_interval_min: 5
+  tick_interval_sec: 10
+
+data:
+  intraday_lookback_days: 5
+  daily_lookback_days: 60
+  ws_heartbeat_timeout_sec: 15
+  rate_limit_data_per_sec: 5
+  rate_limit_option_chain_sec: 3
+
+notifications:
+  telegram_enabled: false
+  console_enabled: true

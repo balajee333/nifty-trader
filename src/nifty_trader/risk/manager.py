@@ -6,7 +6,6 @@ import logging
 from dataclasses import dataclass, field
 
 from nifty_trader.config import RiskConfig, SpreadConfig
-from nifty_trader.constants import NIFTY_LOT_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +59,9 @@ class TrailingState:
 class RiskManager:
     """Handles position sizing, daily loss tracking, trailing stops."""
 
-    def __init__(self, cfg: RiskConfig):
+    def __init__(self, cfg: RiskConfig, lot_size: int = 25):
         self.cfg = cfg
+        self._lot_size = lot_size
         self._daily_pnl: float = 0.0
         self._trade_count: int = 0
         self._open_positions: int = 0
@@ -89,23 +89,23 @@ class RiskManager:
         if sl_per_unit <= 0:
             return None
 
-        risk_per_lot = sl_per_unit * NIFTY_LOT_SIZE
+        risk_per_lot = sl_per_unit * self._lot_size
         lots = int(max_risk / risk_per_lot)
 
         if lots < 1:
             lots = 1  # Minimum 1 lot
 
-        total_cost = entry_price * lots * NIFTY_LOT_SIZE
+        total_cost = entry_price * lots * self._lot_size
         if total_cost > self.cfg.capital:
-            lots = int(self.cfg.capital / (entry_price * NIFTY_LOT_SIZE))
+            lots = int(self.cfg.capital / (entry_price * self._lot_size))
             if lots < 1:
                 logger.warning("Insufficient capital for even 1 lot at %.2f", entry_price)
                 return None
 
         return PositionSize(
             lots=lots,
-            quantity=lots * NIFTY_LOT_SIZE,
-            risk_amount=sl_per_unit * lots * NIFTY_LOT_SIZE,
+            quantity=lots * self._lot_size,
+            risk_amount=sl_per_unit * lots * self._lot_size,
             sl_per_unit=sl_per_unit,
         )
 
@@ -189,7 +189,7 @@ class RiskManager:
             return None
 
         max_risk = self.cfg.capital * self.cfg.risk_per_trade_pct / 100
-        max_loss_per_lot = (spread_width - net_credit) * NIFTY_LOT_SIZE
+        max_loss_per_lot = (spread_width - net_credit) * self._lot_size
 
         if max_loss_per_lot <= 0:
             # Spread credit exceeds width — free money, unlikely but cap at 1 lot
@@ -209,7 +209,7 @@ class RiskManager:
 
         return SpreadPositionSize(
             lots=lots,
-            quantity=lots * NIFTY_LOT_SIZE,
+            quantity=lots * self._lot_size,
             max_risk=max_loss_per_lot * lots,
             net_credit=net_credit,
             spread_width=spread_width,

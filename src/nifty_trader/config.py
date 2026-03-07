@@ -11,6 +11,20 @@ from dotenv import load_dotenv
 
 
 @dataclass(frozen=True)
+class InstrumentConfig:
+    """Parameterizes the underlying instrument (NIFTY, Gold Mini, Crude, etc.)."""
+    name: str = "NIFTY"
+    security_id: str = "13"
+    exchange_segment: str = "NSE_FNO"
+    spot_exchange_segment: str = "IDX_I"
+    instrument_type: str = "INDEX"
+    lot_size: int = 25
+    feed_code: int = 0          # DhanHQ MarketFeed: 0=IDX, 5=MCX
+    market_open: str = "09:15"
+    market_close: str = "15:30"
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     ema_fast: int = 9
     ema_slow: int = 21
@@ -103,6 +117,7 @@ class AppConfig:
     telegram_chat_id: str = ""
     paper_mode: bool = True
     strategy_mode: str = "directional"
+    instrument: InstrumentConfig = field(default_factory=InstrumentConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     strike: StrikeConfig = field(default_factory=StrikeConfig)
@@ -151,6 +166,7 @@ def load_config(
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         paper_mode=os.getenv("PAPER_MODE", "true").lower() == "true",
         strategy_mode=raw.get("strategy_mode", "directional"),
+        instrument=_make_sub(InstrumentConfig, raw.get("instrument")),
         strategy=_make_sub(StrategyConfig, raw.get("strategy")),
         risk=_make_sub(RiskConfig, raw.get("risk")),
         strike=_make_sub(StrikeConfig, raw.get("strike")),

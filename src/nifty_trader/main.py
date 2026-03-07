@@ -59,8 +59,11 @@ class TradingEngine:
             self.dhan.base_url = config.dhan_base_url
             logger.info("Using custom API base URL: %s", config.dhan_base_url)
 
+        # Instrument config
+        self.inst = config.instrument
+
         # Core components
-        self.risk_mgr = RiskManager(config.risk)
+        self.risk_mgr = RiskManager(config.risk, lot_size=self.inst.lot_size)
         self.fsm = TradeFSM()
         self.tracker = OrderTracker()
         self.journal = TradeJournal(Path("trade_journal.db"))
@@ -70,8 +73,11 @@ class TradingEngine:
             telegram_enabled=config.notifications.telegram_enabled,
             console_enabled=config.notifications.console_enabled,
         )
-        self.validator = OrderValidator(config, self.risk_mgr)
-        self.order_mgr = OrderManager(self.dhan, self.tracker, self.journal, config.paper_mode)
+        self.validator = OrderValidator(config, self.risk_mgr, lot_size=self.inst.lot_size, market_open=self.inst.market_open)
+        self.order_mgr = OrderManager(
+            self.dhan, self.tracker, self.journal, config.paper_mode,
+            exchange_segment=self.inst.exchange_segment,
+        )
         self.super_order_mgr = SuperOrderManager(self.dhan, self.tracker, self.journal, config.paper_mode)
         self.kill_switch = KillSwitch(
             self.dhan, self.tracker, self.notifier,
@@ -79,11 +85,14 @@ class TradingEngine:
             capital=config.risk.capital,
         )
         self.reconciler = Reconciler(self.dhan, self.journal, self.notifier, config.risk.capital)
-        self.dashboard = Dashboard()
+        self.dashboard = Dashboard(instrument_name=self.inst.name)
 
         # Data layer
         self.hist_fetcher = HistoricalDataFetcher(self.dhan, config.data.rate_limit_data_per_sec)
-        self.chain_fetcher = OptionChainFetcher(self.dhan, config.data.rate_limit_option_chain_sec)
+        self.chain_fetcher = OptionChainFetcher(
+            self.dhan, config.data.rate_limit_option_chain_sec,
+            exchange_segment=self.inst.exchange_segment,
+        )
         self.feed = MarketFeedManager(
             self.dhan,
             on_tick=self._on_tick,
@@ -107,8 +116,8 @@ class TradingEngine:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
         mode = "PAPER" if self.cfg.paper_mode else "LIVE"
-        logger.info("Starting NIFTY Trader in %s mode", mode)
-        self.notifier.info(f"NIFTY Trader started in {mode} mode")
+        logger.info("Starting %s Trader in %s mode", self.inst.name, mode)
+        self.notifier.info(f"{self.inst.name} Trader started in {mode} mode")
         self.journal.log_event("STARTUP", f"Engine started in {mode} mode")
 
         try:
@@ -137,7 +146,12 @@ class TradingEngine:
             logger.exception("API connectivity check failed")
 
         # Fetch daily candles for S/R levels
-        daily_df = self.hist_fetcher.get_daily(lookback_days=self.cfg.data.daily_lookback_days)
+        daily_df = self.hist_fetcher.get_daily(
+            security_id=self.inst.security_id,
+            exchange=self.inst.spot_exchange_segment,
+            lookback_days=self.cfg.data.daily_lookback_days,
+            instrument_type=self.inst.instrument_type,
+        )
         if not daily_df.empty:
             self._level_detector = LevelDetector(daily_df)
             logger.info("Loaded %d daily candles, computed S/R levels", len(daily_df))
@@ -146,9 +160,9 @@ class TradingEngine:
             logger.warning("No daily data — S/R levels unavailable")
 
         # Subscribe and start market feed
-        self.feed.subscribe_nifty_spot()
+        self.feed.subscribe_spot(self.inst.feed_code, self.inst.security_id)
         self.feed.start()
-        logger.info("Market feed started")
+        logger.info("Market feed started for %s", self.inst.name)
 
     def _event_loop(self):
         """Main event loop — runs until shutdown."""
@@ -178,7 +192,7 @@ class TradingEngine:
 
             # Force exit time
             if now_time >= dtime(exit_h, exit_m) and self.fsm.has_position:
-                self._force_exit("Time-based force exit at 15:15")
+                self._force_exit(f"Time-based force exit at {self.cfg.timing.force_exit}")
 
             # Reconciliation time
             if now_time >= dtime(recon_h, recon_m):
@@ -220,7 +234,10 @@ class TradingEngine:
         """Called every 5 minutes — refresh indicators, evaluate confluence."""
         # Fetch fresh intraday data
         self._intraday_df = self.hist_fetcher.get_intraday_5min(
-            lookback_days=self.cfg.data.intraday_lookback_days
+            security_id=self.inst.security_id,
+            exchange=self.inst.spot_exchange_segment,
+            lookback_days=self.cfg.data.intraday_lookback_days,
+            instrument_type=self.inst.instrument_type,
         )
 
         if self._intraday_df is None or self._intraday_df.empty:
@@ -264,14 +281,14 @@ class TradingEngine:
     def _try_enter_trade(self, direction: Direction):
         """Attempt to enter a trade after signal detection."""
         # Get expiry
-        expiry = self.chain_fetcher.nearest_weekly_expiry()
+        expiry = self.chain_fetcher.nearest_weekly_expiry(self.inst.security_id)
         if not expiry:
             logger.warning("No expiry available — aborting")
             self.fsm.reset()
             return
 
         # Get option chain
-        contracts = self.chain_fetcher.get_chain(expiry)
+        contracts = self.chain_fetcher.get_chain(expiry, self.inst.security_id)
         if not contracts:
             logger.warning("Empty option chain — aborting")
             self.fsm.reset()
@@ -363,7 +380,7 @@ class TradingEngine:
         # Get current LTP
         ltp = self.feed.get_ltp(ctx.security_id)
         if ltp is None:
-            ltp = self.feed.fetch_ltp_rest(ctx.security_id)
+            ltp = self.feed.fetch_ltp_rest(ctx.security_id, self.inst.exchange_segment)
         if ltp is None:
             return
 
@@ -419,13 +436,13 @@ class TradingEngine:
 
     def _try_enter_spread(self, direction: Direction) -> bool:
         """Attempt to enter a credit spread. Returns True if successful."""
-        expiry = self.chain_fetcher.nearest_weekly_expiry()
+        expiry = self.chain_fetcher.nearest_weekly_expiry(self.inst.security_id)
         if not expiry:
             logger.warning("No expiry available for spread — aborting")
             self.fsm.reset()
             return False
 
-        contracts = self.chain_fetcher.get_chain(expiry)
+        contracts = self.chain_fetcher.get_chain(expiry, self.inst.security_id)
         if not contracts:
             logger.warning("Empty option chain for spread — aborting")
             self.fsm.reset()
@@ -513,10 +530,10 @@ class TradingEngine:
 
         short_ltp = self.feed.get_ltp(ctx.short_security_id)
         if short_ltp is None:
-            short_ltp = self.feed.fetch_ltp_rest(ctx.short_security_id)
+            short_ltp = self.feed.fetch_ltp_rest(ctx.short_security_id, self.inst.exchange_segment)
         long_ltp = self.feed.get_ltp(ctx.long_security_id)
         if long_ltp is None:
-            long_ltp = self.feed.fetch_ltp_rest(ctx.long_security_id)
+            long_ltp = self.feed.fetch_ltp_rest(ctx.long_security_id, self.inst.exchange_segment)
 
         if short_ltp is None or long_ltp is None:
             return
@@ -570,16 +587,16 @@ class TradingEngine:
         if ctx.is_spread:
             short_ltp = self.feed.get_ltp(ctx.short_security_id)
             if short_ltp is None:
-                short_ltp = self.feed.fetch_ltp_rest(ctx.short_security_id) or ctx.short_entry_price
+                short_ltp = self.feed.fetch_ltp_rest(ctx.short_security_id, self.inst.exchange_segment) or ctx.short_entry_price
             long_ltp = self.feed.get_ltp(ctx.long_security_id)
             if long_ltp is None:
-                long_ltp = self.feed.fetch_ltp_rest(ctx.long_security_id) or ctx.long_entry_price
+                long_ltp = self.feed.fetch_ltp_rest(ctx.long_security_id, self.inst.exchange_segment) or ctx.long_entry_price
             self._exit_spread(short_ltp, long_ltp, reason)
             return
 
         ltp = self.feed.get_ltp(self.fsm.ctx.security_id)
         if ltp is None:
-            ltp = self.feed.fetch_ltp_rest(self.fsm.ctx.security_id) or self.fsm.ctx.entry_price
+            ltp = self.feed.fetch_ltp_rest(self.fsm.ctx.security_id, self.inst.exchange_segment) or self.fsm.ctx.entry_price
         self._exit_position(ltp, reason)
 
     def _on_tick(self, message: dict):
@@ -587,7 +604,7 @@ class TradingEngine:
         pass  # Position monitoring done in event loop
 
     def _update_dashboard(self, status: str):
-        nifty = self.feed.get_ltp("13") or 0.0
+        nifty = self.feed.get_ltp(self.inst.security_id) or 0.0
         self.dashboard.update(
             self.fsm,
             nifty_price=nifty,
@@ -607,13 +624,13 @@ class TradingEngine:
         self.feed.stop()
         self.dashboard.stop()
         self.journal.close()
-        self.notifier.info("NIFTY Trader stopped")
+        self.notifier.info(f"{self.inst.name} Trader stopped")
         logger.info("Shutdown complete")
 
 
-def dry_run():
+def dry_run(config_path: str | None = None):
     """Run a quick startup verification — works outside market hours."""
-    config = load_config()
+    config = load_config(yaml_path=config_path)
 
     if not config.dhan_client_id or not config.dhan_access_token:
         print("ERROR: Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env")
@@ -655,18 +672,19 @@ def dry_run():
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="NIFTY 50 Options Trading System")
+    parser = argparse.ArgumentParser(description="Options Trading System (NIFTY / MCX Commodities)")
     parser.add_argument("--dry-run", action="store_true", help="Verify startup without trading")
+    parser.add_argument("--config", help="Path to config YAML (default: config/settings.yaml)")
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_config(yaml_path=args.config)
 
     if not config.dhan_client_id or not config.dhan_access_token:
         print("ERROR: Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env")
         sys.exit(1)
 
     if args.dry_run:
-        dry_run()
+        dry_run(config_path=args.config)
     else:
         engine = TradingEngine(config)
         engine.run()

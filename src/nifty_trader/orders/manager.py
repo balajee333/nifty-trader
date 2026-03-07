@@ -31,11 +31,13 @@ class OrderManager:
         tracker: OrderTracker,
         journal: TradeJournal,
         paper_mode: bool = True,
+        exchange_segment: str = "NSE_FNO",
     ):
         self._dhan = dhan
         self._tracker = tracker
         self._journal = journal
         self._paper_mode = paper_mode
+        self._exchange_segment = exchange_segment
         self._next_paper_id = 1000
 
     def place_market_buy(
@@ -54,7 +56,7 @@ class OrderManager:
         try:
             resp = self._dhan.place_order(
                 security_id=security_id,
-                exchange_segment=ExchangeSegment.NSE_FNO,
+                exchange_segment=self._exchange_segment,
                 transaction_type=TransactionType.BUY,
                 quantity=quantity,
                 order_type=OrderType.MARKET,
@@ -82,7 +84,7 @@ class OrderManager:
         try:
             resp = self._dhan.place_order(
                 security_id=security_id,
-                exchange_segment=ExchangeSegment.NSE_FNO,
+                exchange_segment=self._exchange_segment,
                 transaction_type=TransactionType.SELL,
                 quantity=quantity,
                 order_type=OrderType.SL_MARKET,
@@ -109,7 +111,7 @@ class OrderManager:
         try:
             resp = self._dhan.place_order(
                 security_id=security_id,
-                exchange_segment=ExchangeSegment.NSE_FNO,
+                exchange_segment=self._exchange_segment,
                 transaction_type=TransactionType.SELL,
                 quantity=quantity,
                 order_type=OrderType.MARKET,
@@ -282,7 +284,7 @@ class OrderManager:
         try:
             resp = self._dhan.place_order(
                 security_id=security_id,
-                exchange_segment=ExchangeSegment.NSE_FNO,
+                exchange_segment=self._exchange_segment,
                 transaction_type=txn_type,
                 quantity=quantity,
                 order_type=order_type,

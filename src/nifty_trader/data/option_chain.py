@@ -47,9 +47,10 @@ class OptionContract:
 class OptionChainFetcher:
     """Fetches option chain data with 3-second rate limiting per unique request."""
 
-    def __init__(self, dhan: DhanHQ, min_interval_sec: float = 3.0):
+    def __init__(self, dhan: DhanHQ, min_interval_sec: float = 3.0, exchange_segment: str = "NSE_FNO"):
         self._dhan = dhan
         self._min_interval = min_interval_sec
+        self._exchange_segment = exchange_segment
         self._last_fetch: float = 0.0
         self._cached_expiries: list[str] = []
         self._expiry_fetched_at: float = 0.0
@@ -70,7 +71,7 @@ class OptionChainFetcher:
         try:
             resp = self._dhan.expiry_list(
                 under_security_id=int(security_id),
-                under_exchange_segment=ExchangeSegment.NSE_FNO,
+                under_exchange_segment=self._exchange_segment,
             )
             if resp and resp.get("status") == "success":
                 self._cached_expiries = sorted(resp.get("data", []))
@@ -99,7 +100,7 @@ class OptionChainFetcher:
         try:
             resp = self._dhan.option_chain(
                 under_security_id=int(security_id),
-                under_exchange_segment=ExchangeSegment.NSE_FNO,
+                under_exchange_segment=self._exchange_segment,
                 expiry=expiry,
             )
         except Exception:

@@ -14,9 +14,11 @@ logger = logging.getLogger(__name__)
 class OrderValidator:
     """Validates whether a new order should be placed."""
 
-    def __init__(self, config: AppConfig, risk_mgr: RiskManager):
+    def __init__(self, config: AppConfig, risk_mgr: RiskManager, lot_size: int = 25, market_open: str = "09:15"):
         self._cfg = config
         self._risk = risk_mgr
+        self._lot_size = lot_size
+        self._market_open = market_open
         self._last_order_security_id: str | None = None
         self._last_order_time: datetime | None = None
 
@@ -42,7 +44,8 @@ class OrderValidator:
         now = datetime.now().time()
         parts = self._cfg.timing.no_entry_after.split(":")
         cutoff = time(int(parts[0]), int(parts[1]))
-        open_time = time(9, 15)
+        open_parts = self._market_open.split(":")
+        open_time = time(int(open_parts[0]), int(open_parts[1]))
 
         if now < open_time:
             return False, f"Market not open yet ({now})"
@@ -70,8 +73,7 @@ class OrderValidator:
         return True, ""
 
     def _check_funds(self, premium: float) -> tuple[bool, str]:
-        from nifty_trader.constants import NIFTY_LOT_SIZE
-        cost = premium * NIFTY_LOT_SIZE
+        cost = premium * self._lot_size
         if cost > self._cfg.risk.capital:
             return False, f"Premium cost {cost:.0f} exceeds capital {self._cfg.risk.capital:.0f}"
         return True, ""
@@ -101,8 +103,7 @@ class OrderValidator:
         return True, "All spread checks passed"
 
     def _check_spread_margin(self, net_credit: float, spread_width: float) -> tuple[bool, str]:
-        from nifty_trader.constants import NIFTY_LOT_SIZE
-        max_loss_per_lot = (spread_width - net_credit) * NIFTY_LOT_SIZE
+        max_loss_per_lot = (spread_width - net_credit) * self._lot_size
         risk_limit = self._cfg.risk.capital * self._cfg.risk.risk_per_trade_pct / 100
         if max_loss_per_lot > risk_limit:
             return False, (

@@ -18,10 +18,11 @@ from nifty_trader.state import TradeFSM
 class Dashboard:
     """Rich-based live terminal dashboard."""
 
-    def __init__(self):
+    def __init__(self, instrument_name: str = "NIFTY"):
         self._console = Console()
         self._live: Live | None = None
-        self._nifty_price: float = 0.0
+        self._instrument_name = instrument_name
+        self._spot_price: float = 0.0
         self._daily_pnl: float = 0.0
         self._trade_count: int = 0
         self._signals_text: str = "Waiting..."
@@ -38,7 +39,7 @@ class Dashboard:
         signals_text: str = "",
         system_status: str = "",
     ):
-        self._nifty_price = nifty_price
+        self._spot_price = nifty_price
         self._daily_pnl = daily_pnl
         self._trade_count = trade_count
         if signals_text:
@@ -82,7 +83,7 @@ class Dashboard:
     def _header_panel(self) -> Panel:
         pnl_color = "green" if self._daily_pnl >= 0 else "red"
         text = Text()
-        text.append("NIFTY TRADER", style="bold white")
+        text.append(f"{self._instrument_name} TRADER", style="bold white")
         text.append(f"  |  P&L: ", style="white")
         text.append(f"{self._daily_pnl:+.2f}", style=pnl_color)
         text.append(f"  |  Trades: {self._trade_count}", style="white")
@@ -93,7 +94,7 @@ class Dashboard:
         table = Table(show_header=False, expand=True)
         table.add_column("Field", style="cyan")
         table.add_column("Value")
-        table.add_row("NIFTY 50", f"{self._nifty_price:.2f}")
+        table.add_row(self._instrument_name, f"{self._spot_price:.2f}")
         table.add_row("Status", self._system_status)
         return Panel(table, title="Market", border_style="green")
 

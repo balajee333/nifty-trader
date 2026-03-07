@@ -67,6 +67,38 @@ class TestTrailing:
         assert "Target" in reason
 
 
+class TestLotSizeParameterization:
+    def test_default_lot_size(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0, sl_pct=35.0))
+        size = mgr.compute_position_size(200)
+        assert size is not None
+        assert size.quantity == size.lots * 25
+
+    def test_mcx_gold_mini_lot_size(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0, sl_pct=35.0), lot_size=100)
+        size = mgr.compute_position_size(50)
+        assert size is not None
+        assert size.quantity == size.lots * 100
+
+    def test_mcx_spread_sizing_too_risky(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0), lot_size=100)
+        size = mgr.compute_spread_position_size(net_credit=15.0, spread_width=500.0)
+        # max_loss_per_lot = (500 - 15) * 100 = 48500 > 2× risk limit 4000 → rejected
+        assert size is None
+
+    def test_mcx_spread_sizing_feasible(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0), lot_size=100)
+        size = mgr.compute_spread_position_size(net_credit=10.0, spread_width=20.0)
+        assert size is not None
+        assert size.quantity == size.lots * 100
+
+    def test_natural_gas_lot_size(self):
+        mgr = RiskManager(RiskConfig(capital=100_000, risk_per_trade_pct=2.0, sl_pct=35.0), lot_size=1250)
+        size = mgr.compute_position_size(5)
+        assert size is not None
+        assert size.quantity == size.lots * 1250
+
+
 class TestDailyLoss:
     def test_cap(self, risk_mgr):
         assert not risk_mgr.is_daily_stopped

@@ -44,6 +44,7 @@ class HistoricalDataFetcher:
         security_id: str = NIFTY_SECURITY_ID,
         exchange: str = ExchangeSegment.IDX_I,
         lookback_days: int = 5,
+        instrument_type: str = "INDEX",
     ) -> pd.DataFrame:
         """Fetch 5-minute intraday candles."""
         from_date = datetime.now() - timedelta(days=lookback_days)
@@ -54,7 +55,7 @@ class HistoricalDataFetcher:
             resp = self._dhan.intraday_minute_data(
                 security_id=security_id,
                 exchange_segment=exchange,
-                instrument_type="INDEX",
+                instrument_type=instrument_type,
                 from_date=from_date.strftime("%Y-%m-%d"),
                 to_date=to_date.strftime("%Y-%m-%d"),
             )
@@ -69,6 +70,7 @@ class HistoricalDataFetcher:
         security_id: str = NIFTY_SECURITY_ID,
         exchange: str = ExchangeSegment.IDX_I,
         lookback_days: int = 60,
+        instrument_type: str = "INDEX",
     ) -> pd.DataFrame:
         """Fetch daily candles."""
         from_date = datetime.now() - timedelta(days=lookback_days)
@@ -79,7 +81,7 @@ class HistoricalDataFetcher:
             resp = self._dhan.historical_daily_data(
                 security_id=security_id,
                 exchange_segment=exchange,
-                instrument_type="INDEX",
+                instrument_type=instrument_type,
                 from_date=from_date.strftime("%Y-%m-%d"),
                 to_date=to_date.strftime("%Y-%m-%d"),
             )

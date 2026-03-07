@@ -12,6 +12,7 @@ class ExchangeSegment(str, Enum):
     NSE_EQ = "NSE_EQ"
     NSE_FNO = "NSE_FNO"
     IDX_I = "IDX_I"
+    MCX_COMM = "MCX_COMM"
 
 class TransactionType(str, Enum):
     BUY = "BUY"
