@@ -1,0 +1,844 @@
+"""VENOM engine — O=H/O=L scalping orchestrator with VIX gating.
+
+Integrates all VENOM modules (TimeManager, VixGate, OhlcSignalDetector,
+TrailEngine, MonthlyManager, StatePersister) with the existing trading
+infrastructure (FSM, feeds, order manager, risk, journal, dashboard).
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+import time
+from datetime import datetime, time as dtime
+from pathlib import Path
+
+from dhanhq import dhanhq as DhanHQ
+
+from nifty_trader.alerts.notifier import Notifier
+from nifty_trader.config import AppConfig, load_config
+from nifty_trader.constants import Direction, OptionType, TradeState
+from nifty_trader.core.persister import StatePersister, VenomSnapshot
+from nifty_trader.dashboard.console import Dashboard
+from nifty_trader.data.feed import MarketFeedManager
+from nifty_trader.data.historical import HistoricalDataFetcher
+from nifty_trader.data.option_chain import OptionChainFetcher
+from nifty_trader.journal.database import TradeJournal
+from nifty_trader.orders.manager import OrderManager
+from nifty_trader.orders.tracker import OrderTracker
+from nifty_trader.risk.kill_switch import KillSwitch
+from nifty_trader.risk.manager import RiskManager
+from nifty_trader.risk.monthly import MonthlyManager
+from nifty_trader.risk.validator import OrderValidator
+from nifty_trader.state import TradeFSM
+from nifty_trader.strategy.confluence import evaluate_confluence
+from nifty_trader.strategy.levels import LevelDetector
+from nifty_trader.strategy.ohlc_signal import OhlcSignalDetector, SignalType
+from nifty_trader.strategy.strike_selector import select_strike
+from nifty_trader.strategy.time_manager import TimeManager
+from nifty_trader.strategy.trail_engine import TrailEngine, TrailState
+from nifty_trader.strategy.vix_gate import VixGate, VixMode
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("venom.log"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+# India VIX security ID on DhanHQ
+VIX_SECURITY_ID = "26"
+
+
+class VenomEngine:
+    """Full auto-scalping loop for the VENOM strategy."""
+
+    def __init__(self, config: AppConfig):
+        self.cfg = config
+        self.vcfg = config.venom
+        self._running = False
+
+        # DhanHQ client
+        self.dhan = DhanHQ(
+            client_id=config.dhan_client_id,
+            access_token=config.dhan_access_token,
+        )
+        if config.dhan_base_url:
+            self.dhan.base_url = config.dhan_base_url
+
+        self.inst = config.instrument
+
+        # ------- Existing infrastructure -------
+        self.risk_mgr = RiskManager(config.risk, lot_size=self.inst.lot_size)
+        self.fsm = TradeFSM()
+        self.tracker = OrderTracker()
+        self.journal = TradeJournal(Path("venom_journal.db"))
+        self.notifier = Notifier(
+            telegram_bot_token=config.telegram_bot_token,
+            telegram_chat_id=config.telegram_chat_id,
+            telegram_enabled=config.notifications.telegram_enabled,
+            console_enabled=config.notifications.console_enabled,
+        )
+        self.validator = OrderValidator(
+            config, self.risk_mgr,
+            lot_size=self.inst.lot_size,
+            market_open=self.inst.market_open,
+        )
+        self.order_mgr = OrderManager(
+            self.dhan, self.tracker, self.journal, config.paper_mode,
+            exchange_segment=self.inst.exchange_segment,
+        )
+        self.kill_switch = KillSwitch(
+            self.dhan, self.tracker, self.notifier,
+            max_single_loss_pct=config.risk.max_single_loss_pct,
+            capital=config.risk.capital,
+        )
+        self.dashboard = Dashboard(instrument_name=f"VENOM {self.inst.name}")
+
+        # Data layer
+        self.hist_fetcher = HistoricalDataFetcher(
+            self.dhan, config.data.rate_limit_data_per_sec,
+        )
+        self.chain_fetcher = OptionChainFetcher(
+            self.dhan, config.data.rate_limit_option_chain_sec,
+            exchange_segment=self.inst.exchange_segment,
+        )
+        self.feed = MarketFeedManager(
+            self.dhan,
+            on_tick=self._on_tick,
+            heartbeat_timeout=config.data.ws_heartbeat_timeout_sec,
+        )
+
+        # ------- VENOM modules -------
+        self.time_mgr = TimeManager(time_stop_minutes=self.vcfg.time_stop_minutes)
+        self.vix_gate = VixGate(
+            full=self.vcfg.vix_full,
+            selective=self.vcfg.vix_selective,
+            caution=self.vcfg.vix_caution,
+            blocked=self.vcfg.vix_blocked,
+            delta_low=self.vcfg.target_delta_low_vix,
+            delta_high=self.vcfg.target_delta_high_vix,
+        )
+        self.ohlc_detector = OhlcSignalDetector(
+            index_tolerance_pct=self.vcfg.ohlc_tolerance_index_pct,
+            option_tolerance_abs=self.vcfg.ohlc_tolerance_option_abs,
+        )
+        self.trail_engine = TrailEngine(
+            sl_pct=self.vcfg.sl_percent,
+            activation_pct=self.vcfg.trail_activation_pct,
+            trail_distance_pct=self.vcfg.trail_distance_pct,
+            max_profit_pct=self.vcfg.max_profit_pct,
+        )
+        self.monthly_mgr = MonthlyManager(
+            max_daily_loss=self.vcfg.max_daily_loss,
+            max_weekly_loss=self.vcfg.max_weekly_loss,
+            consecutive_loss_limit=self.vcfg.consecutive_loss_limit,
+            mtd_protection_threshold=self.vcfg.mtd_protection_threshold,
+            mtd_protection_size_reduction=self.vcfg.mtd_protection_size_reduction,
+            mtd_stop_threshold=self.vcfg.mtd_stop_threshold,
+            mtd_stop_days=self.vcfg.mtd_stop_days,
+            mtd_resume_size_reduction=self.vcfg.mtd_resume_size_reduction,
+        )
+        self.persister = StatePersister()
+
+        # ------- Runtime state -------
+        self._vix: float = 0.0
+        self._ohlc_signal_text: str = ""
+        self._trail_state: TrailState | None = None
+        self._sl_order_id: str | None = None
+        self._daily_pnl: float = 0.0
+        self._trade_count: int = 0
+        self._consecutive_losses: int = 0
+        self._recent_pnls: list[float] = []
+        self._level_detector: LevelDetector | None = None
+        self._signal_detected: bool = False
+        self._weekly_pnl: float = 0.0
+        self._monthly_pnl: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def run(self):
+        """Main entry point — run the VENOM event loop."""
+        self._running = True
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+
+        mode = "PAPER" if self.cfg.paper_mode else "LIVE"
+        logger.info("VENOM engine starting in %s mode", mode)
+        self.notifier.info(f"VENOM started in {mode} mode")
+        self.journal.log_event("STARTUP", f"VENOM engine started in {mode} mode")
+
+        # Attempt crash recovery
+        self._recover_state()
+
+        try:
+            self._pre_market_setup()
+            self._event_loop()
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested")
+        except Exception:
+            logger.exception("Fatal error in VENOM event loop")
+            self.notifier.error("VENOM fatal error — shutting down")
+        finally:
+            self._shutdown()
+
+    def _handle_shutdown(self, signum, frame):
+        logger.info("Received signal %d, shutting down...", signum)
+        self._running = False
+
+    def _shutdown(self):
+        logger.info("VENOM shutting down...")
+        if self.fsm.has_position:
+            self._force_exit("System shutdown")
+        self.feed.stop()
+        self.persister.clear()
+        self.dashboard.stop()
+        self.journal.close()
+        self.notifier.info("VENOM stopped")
+        logger.info("VENOM shutdown complete")
+
+    # ------------------------------------------------------------------
+    # Pre-market
+    # ------------------------------------------------------------------
+
+    def _pre_market_setup(self):
+        """Subscribe feeds, load daily candle data for S/R levels."""
+        logger.info("VENOM pre-market setup...")
+
+        # Verify API connectivity
+        try:
+            fund_resp = self.dhan.get_fund_limits()
+            if fund_resp and fund_resp.get("status") == "success":
+                logger.info("API connectivity verified")
+            else:
+                logger.warning("API connectivity check returned: %s", fund_resp)
+        except Exception:
+            logger.exception("API connectivity check failed")
+
+        # Fetch daily candles for S/R levels
+        daily_df = self.hist_fetcher.get_daily(
+            security_id=self.inst.security_id,
+            exchange=self.inst.spot_exchange_segment,
+            lookback_days=self.cfg.data.daily_lookback_days,
+            instrument_type=self.inst.instrument_type,
+        )
+        self._level_detector = LevelDetector(daily_df)
+        if not daily_df.empty:
+            logger.info("Loaded %d daily candles for S/R levels", len(daily_df))
+
+        # Subscribe to index + VIX
+        self.feed.subscribe_spot(self.inst.feed_code, self.inst.security_id)
+        self.feed.subscribe_spot(feed_code=0, security_id=VIX_SECURITY_ID)
+        self.feed.start()
+        logger.info("Market feed started (index + VIX)")
+
+    # ------------------------------------------------------------------
+    # Event loop
+    # ------------------------------------------------------------------
+
+    def _event_loop(self):
+        tick_interval = self.cfg.timing.tick_interval_sec
+
+        while self._running:
+            now = datetime.now()
+            now_time = now.time()
+            window = self.time_mgr.get_window(now_time)
+
+            # Read VIX from feed
+            vix_ltp = self.feed.get_ltp(VIX_SECURITY_ID)
+            if vix_ltp is not None:
+                self._vix = vix_ltp
+
+            # Kill switch
+            if self.kill_switch.is_triggered:
+                self._update_dashboard("KILL SWITCH ACTIVE")
+                time.sleep(tick_interval)
+                continue
+
+            # Force exit at 15:15
+            if self.time_mgr.should_force_exit(now_time) and self.fsm.has_position:
+                self._force_exit("Force exit at 15:15")
+
+            # After market close — stop
+            if now_time >= dtime(15, 30):
+                logger.info("Market closed — stopping VENOM")
+                self._running = False
+                break
+
+            # Signal detection window (9:16-9:20): detect O=H/O=L
+            if not self._signal_detected and self.time_mgr.can_enter(now_time):
+                entry_start = self.vcfg.entry_window_start.split(":")
+                signal_end = self.vcfg.signal_detection_end.split(":")
+                if (dtime(int(entry_start[0]), int(entry_start[1]))
+                        <= now_time
+                        < dtime(int(signal_end[0]), int(signal_end[1]))):
+                    self._detect_ohlc_signal()
+
+            # Entry logic — scan for trades when idle + signal present
+            if (self.fsm.is_idle
+                    and self._signal_detected
+                    and self.time_mgr.can_enter(now_time)):
+                if self._pre_entry_checks():
+                    self._try_enter_trade()
+
+            # Monitor open position
+            if self.fsm.has_position:
+                self._monitor_position(now)
+
+            # Kill switch anomaly checks
+            position_count = 1 if self.fsm.has_position else 0
+            current_loss = 0.0
+            if self.fsm.has_position and self.fsm.ctx.entry_price > 0:
+                ltp = self.feed.get_ltp(self.fsm.ctx.security_id) or 0
+                current_loss = (ltp - self.fsm.ctx.entry_price) * self.fsm.ctx.quantity
+            self.kill_switch.check(position_count, current_loss)
+
+            # Persist state every tick
+            self._save_state()
+
+            # Dashboard
+            vix_mode = self.vix_gate.get_mode(self._vix)
+            self._update_dashboard(
+                f"Window: {window.value}",
+                vix_mode=vix_mode.value,
+            )
+
+            time.sleep(tick_interval)
+
+    # ------------------------------------------------------------------
+    # Pre-entry gate checks
+    # ------------------------------------------------------------------
+
+    def _pre_entry_checks(self) -> bool:
+        """Run all gates before allowing an entry. Returns True if clear."""
+        now_time = datetime.now().time()
+
+        # Time window
+        if not self.time_mgr.can_enter(now_time):
+            logger.info("Pre-entry blocked: outside entry window")
+            return False
+
+        # VIX gate
+        if not self.vix_gate.can_trade(self._vix):
+            logger.info("Pre-entry blocked: VIX %.2f too high", self._vix)
+            return False
+
+        # Daily loss limit
+        if not self.monthly_mgr.can_trade_today(self._daily_pnl):
+            logger.info("Pre-entry blocked: daily loss limit hit (%.2f)", self._daily_pnl)
+            return False
+
+        # Weekly loss limit
+        if not self.monthly_mgr.can_trade_this_week(self._weekly_pnl):
+            logger.info("Pre-entry blocked: weekly loss limit hit (%.2f)", self._weekly_pnl)
+            return False
+
+        # Consecutive losses
+        if not self.monthly_mgr.can_trade_after_streak(self._consecutive_losses):
+            logger.info(
+                "Pre-entry blocked: %d consecutive losses",
+                self._consecutive_losses,
+            )
+            return False
+
+        # Max trades per day
+        if self._trade_count >= self.vcfg.max_trades_per_day:
+            logger.info("Pre-entry blocked: max trades (%d) reached", self._trade_count)
+            return False
+
+        # Kill switch
+        if self.kill_switch.is_triggered:
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # O=H/O=L signal detection
+    # ------------------------------------------------------------------
+
+    def _detect_ohlc_signal(self):
+        """Fetch first 5-min candle for index + ATM options and detect O=H/O=L."""
+        try:
+            # Fetch first candle data for the index
+            intraday_df = self.hist_fetcher.get_intraday_5min(
+                security_id=self.inst.security_id,
+                exchange=self.inst.spot_exchange_segment,
+                lookback_days=1,
+                instrument_type=self.inst.instrument_type,
+            )
+            if intraday_df is None or intraday_df.empty:
+                logger.warning("No intraday data for O=H/O=L detection")
+                return
+
+            # First candle
+            first = intraday_df.iloc[0]
+            idx_open = float(first.get("open", first.get("Open", 0)))
+            idx_high = float(first.get("high", first.get("High", 0)))
+            idx_low = float(first.get("low", first.get("Low", 0)))
+            idx_close = float(first.get("close", first.get("Close", 0)))
+
+            if idx_open <= 0:
+                return
+
+            # Get ATM option chain for CE/PE candles
+            expiry = self.chain_fetcher.nearest_weekly_expiry(self.inst.security_id)
+            if not expiry:
+                logger.warning("No expiry for O=H/O=L option candles")
+                return
+
+            contracts = self.chain_fetcher.get_chain(expiry, self.inst.security_id)
+            if not contracts:
+                return
+
+            # Find ATM CE and PE
+            spot = idx_close
+            atm_strike = round(spot / 50) * 50  # Round to nearest 50
+
+            atm_ce = next(
+                (c for c in contracts
+                 if c.option_type == OptionType.CALL
+                 and abs(c.strike_price - atm_strike) < 1),
+                None,
+            )
+            atm_pe = next(
+                (c for c in contracts
+                 if c.option_type == OptionType.PUT
+                 and abs(c.strike_price - atm_strike) < 1),
+                None,
+            )
+
+            if not atm_ce or not atm_pe:
+                logger.warning("ATM CE/PE not found for strike %.0f", atm_strike)
+                return
+
+            # Use LTP as proxy for the first candle OHLC of options
+            # (In practice, you'd fetch 5-min option candles too)
+            ce_price = atm_ce.ltp or atm_ce.mid_price
+            pe_price = atm_pe.ltp or atm_pe.mid_price
+
+            sig = self.ohlc_detector.detect(
+                index_open=idx_open,
+                index_high=idx_high,
+                index_low=idx_low,
+                index_close=idx_close,
+                ce_open=ce_price,
+                ce_high=ce_price * 1.01,  # approximate from chain snapshot
+                ce_low=ce_price * 0.99,
+                ce_close=ce_price,
+                pe_open=pe_price,
+                pe_high=pe_price * 1.01,
+                pe_low=pe_price * 0.99,
+                pe_close=pe_price,
+            )
+
+            self._ohlc_signal_text = f"{sig.signal_type.value}: {sig.reason}"
+            logger.info("OHLC signal: %s", self._ohlc_signal_text)
+
+            if sig.signal_type in (SignalType.BUY_CE, SignalType.BUY_PE):
+                self._signal_detected = True
+                self._ohlc_direction = (
+                    Direction.BULLISH if sig.signal_type == SignalType.BUY_CE
+                    else Direction.BEARISH
+                )
+                self.notifier.info(f"VENOM signal: {self._ohlc_signal_text}")
+            else:
+                self._signal_detected = False
+                logger.info("No actionable O=H/O=L signal — waiting")
+
+        except Exception:
+            logger.exception("O=H/O=L detection failed")
+
+    # ------------------------------------------------------------------
+    # Trade entry
+    # ------------------------------------------------------------------
+
+    def _try_enter_trade(self):
+        """Enter a directional option trade based on the O=H/O=L signal."""
+        direction = getattr(self, "_ohlc_direction", Direction.BULLISH)
+
+        # Check confluence confirmations
+        intraday_df = self.hist_fetcher.get_intraday_5min(
+            security_id=self.inst.security_id,
+            exchange=self.inst.spot_exchange_segment,
+            lookback_days=self.cfg.data.intraday_lookback_days,
+            instrument_type=self.inst.instrument_type,
+        )
+
+        if intraday_df is not None and not intraday_df.empty and self._level_detector:
+            result = evaluate_confluence(intraday_df, self._level_detector, self.cfg.strategy)
+
+            # VIX-adjusted threshold
+            min_confirms = self.vix_gate.min_confirmations(self._vix)
+            active_signals = sum(
+                1 for s in result.signals
+                if s.direction == direction
+            )
+            if active_signals < min_confirms:
+                logger.info(
+                    "Confluence insufficient: %d/%d confirmations",
+                    active_signals, min_confirms,
+                )
+                return
+
+        # Get expiry + chain
+        expiry = self.chain_fetcher.nearest_weekly_expiry(self.inst.security_id)
+        if not expiry:
+            logger.warning("No expiry — aborting entry")
+            return
+
+        contracts = self.chain_fetcher.get_chain(expiry, self.inst.security_id)
+        if not contracts:
+            logger.warning("Empty option chain — aborting entry")
+            return
+
+        # Override delta target based on VIX
+        target_delta = self.vix_gate.target_delta(self._vix)
+        from dataclasses import replace
+        strike_cfg = replace(
+            self.cfg.strike,
+            delta_target=target_delta,
+        )
+
+        selection = select_strike(contracts, direction, strike_cfg)
+        if not selection:
+            logger.info("No suitable strike for VENOM entry")
+            return
+
+        contract = selection.contract
+        premium = contract.ltp if contract.ltp > 0 else contract.mid_price
+
+        # Check max premium
+        max_prem = self.vcfg.max_premium_nifty
+        if premium > max_prem:
+            logger.info("Premium %.2f > max %.2f — skipping", premium, max_prem)
+            return
+
+        # Validate
+        ok, reason = self.validator.validate(contract.security_id, premium)
+        if not ok:
+            logger.info("Validation failed: %s", reason)
+            return
+
+        # Position sizing with VIX multiplier
+        size = self.risk_mgr.compute_position_size(premium)
+        if not size:
+            logger.warning("Position sizing failed")
+            return
+
+        vix_mult = self.vix_gate.size_multiplier(self._vix)
+        adjusted_qty = max(self.inst.lot_size, int(size.quantity * vix_mult))
+        # Round to lot size
+        adjusted_qty = (adjusted_qty // self.inst.lot_size) * self.inst.lot_size
+
+        # Signal FSM
+        self.fsm.start_signal(direction, 1.0, self._ohlc_signal_text)
+
+        # Place market buy
+        order_id = self.order_mgr.place_market_buy(
+            security_id=contract.security_id,
+            quantity=adjusted_qty,
+        )
+
+        if not order_id:
+            logger.warning("Market buy failed")
+            self.fsm.reset()
+            return
+
+        # Place SL order
+        trail_state = self.trail_engine.create_state(premium)
+        self._sl_order_id = self.order_mgr.place_sl_order(
+            security_id=contract.security_id,
+            quantity=adjusted_qty,
+            trigger_price=trail_state.sl_price,
+        )
+
+        # Update FSM
+        self.fsm.order_placed(
+            order_id=order_id,
+            security_id=contract.security_id,
+            strike_price=contract.strike_price,
+            expiry=expiry,
+            quantity=adjusted_qty,
+        )
+
+        # In paper mode, immediately fill
+        if self.cfg.paper_mode:
+            trailing = self.risk_mgr.create_trailing_state(premium)
+            self.fsm.position_opened(premium, trailing)
+            self.risk_mgr.on_position_opened()
+            self.feed.subscribe_option(contract.security_id)
+
+        self._trail_state = trail_state
+        self._signal_detected = False  # Consumed
+
+        self.notifier.trade_entry(
+            f"VENOM {contract.option_type.value} {contract.strike_price:.0f} "
+            f"{expiry} @ {premium:.2f} qty={adjusted_qty} "
+            f"SL={trail_state.sl_price:.2f}"
+        )
+        logger.info("VENOM entry placed: %s", contract.security_id)
+
+    # ------------------------------------------------------------------
+    # Position monitoring
+    # ------------------------------------------------------------------
+
+    def _monitor_position(self, now: datetime):
+        """Monitor open position: trail SL, time stop, exit."""
+        ctx = self.fsm.ctx
+        if not ctx.security_id:
+            return
+
+        ltp = self.feed.get_ltp(ctx.security_id)
+        if ltp is None:
+            ltp = self.feed.fetch_ltp_rest(ctx.security_id, self.inst.exchange_segment)
+        if ltp is None:
+            return
+
+        # Run trail engine
+        if self._trail_state:
+            action = self.trail_engine.update(self._trail_state, ltp)
+
+            if action == "SL_HIT":
+                self._exit_position(ltp, "Trailing SL hit")
+                return
+            if action == "EXIT_MAX_PROFIT":
+                self._exit_position(ltp, "Max profit target hit")
+                return
+            if action in ("MOVE_SL_TO_COST", "LOCK_PROFIT", "TRAILING"):
+                # Modify the broker SL order
+                if self._sl_order_id:
+                    self.order_mgr.modify_sl_trigger(
+                        self._sl_order_id, self._trail_state.sl_price,
+                    )
+                if self.fsm.state == TradeState.POSITION_OPEN:
+                    self.fsm.start_trailing()
+                logger.info(
+                    "Trail action=%s new_sl=%.2f", action, self._trail_state.sl_price,
+                )
+
+        # Time stop: flat after N minutes
+        if ctx.entry_time and ctx.entry_price > 0:
+            pnl_pct = ((ltp - ctx.entry_price) / ctx.entry_price) * 100
+            if self.time_mgr.time_stop_hit(ctx.entry_time, now, pnl_pct):
+                self._exit_position(ltp, f"Time stop (flat {pnl_pct:+.1f}%)")
+                return
+
+        # Also update the trailing state in the existing risk mgr
+        if ctx.trailing:
+            self.risk_mgr.update_trailing(ctx.trailing, ltp)
+            if self.fsm.state == TradeState.POSITION_OPEN and ctx.trailing.at_breakeven:
+                self.fsm.start_trailing()
+
+    # ------------------------------------------------------------------
+    # Exit
+    # ------------------------------------------------------------------
+
+    def _exit_position(self, exit_price: float, reason: str):
+        ctx = self.fsm.ctx
+        self.fsm.start_exit(reason)
+
+        if not self.cfg.paper_mode:
+            self.order_mgr.place_market_sell(ctx.security_id, ctx.quantity)
+            if self._sl_order_id:
+                self.order_mgr.cancel_order(self._sl_order_id)
+                self._sl_order_id = None
+
+        self.fsm.position_closed(exit_price)
+        self.risk_mgr.on_position_closed()
+
+        pnl = ctx.pnl
+        self.risk_mgr.record_trade_pnl(pnl)
+        self.journal.log_trade(ctx)
+
+        # Update daily tracking
+        self._daily_pnl += pnl
+        self._trade_count += 1
+        self._recent_pnls.append(pnl)
+        self._consecutive_losses = self.monthly_mgr.compute_consecutive_losses(
+            self._recent_pnls,
+        )
+        self._weekly_pnl += pnl
+        self._monthly_pnl += pnl
+
+        self.notifier.trade_exit(
+            f"VENOM {ctx.option_type.value} {ctx.strike_price:.0f} | "
+            f"P&L: {pnl:+.2f} | {reason}"
+        )
+
+        # Clean up
+        self._trail_state = None
+        self.fsm.transition(TradeState.CLOSED)
+        self.fsm.reset()
+
+    def _force_exit(self, reason: str):
+        if not self.fsm.has_position:
+            return
+        ctx = self.fsm.ctx
+        ltp = self.feed.get_ltp(ctx.security_id)
+        if ltp is None:
+            ltp = self.feed.fetch_ltp_rest(
+                ctx.security_id, self.inst.exchange_segment,
+            ) or ctx.entry_price
+        self._exit_position(ltp, reason)
+
+    # ------------------------------------------------------------------
+    # State persistence / recovery
+    # ------------------------------------------------------------------
+
+    def _save_state(self):
+        trail_dict = None
+        if self._trail_state:
+            trail_dict = {
+                "entry_price": self._trail_state.entry_price,
+                "sl_price": self._trail_state.sl_price,
+                "peak_price": self._trail_state.peak_price,
+                "risk_free": self._trail_state.risk_free,
+                "rungs_hit": self._trail_state.rungs_hit,
+            }
+
+        position = None
+        if self.fsm.has_position:
+            ctx = self.fsm.ctx
+            position = {
+                "security_id": ctx.security_id,
+                "strike_price": ctx.strike_price,
+                "entry_price": ctx.entry_price,
+                "quantity": ctx.quantity,
+                "direction": ctx.direction.value,
+                "option_type": ctx.option_type.value,
+            }
+
+        snap = VenomSnapshot(
+            fsm_state=self.fsm.state.value,
+            position=position,
+            daily_pnl=self._daily_pnl,
+            trade_count=self._trade_count,
+            consecutive_losses=self._consecutive_losses,
+            signal={"text": self._ohlc_signal_text} if self._ohlc_signal_text else None,
+            trail_state=trail_dict,
+        )
+        self.persister.save(snap)
+
+    def _recover_state(self):
+        snap = self.persister.load()
+        if not snap:
+            logger.info("No crash recovery state found")
+            return
+
+        logger.info("Recovering from snapshot: state=%s", snap.fsm_state)
+        self._daily_pnl = snap.daily_pnl
+        self._trade_count = snap.trade_count
+        self._consecutive_losses = snap.consecutive_losses
+
+        if snap.signal:
+            self._ohlc_signal_text = snap.signal.get("text", "")
+
+        if snap.fsm_state in ("POSITION_OPEN", "TRAILING") and snap.position:
+            pos = snap.position
+            logger.warning(
+                "Recovered open position: %s @ %.2f qty=%d — will monitor",
+                pos.get("security_id"), pos.get("entry_price", 0), pos.get("quantity", 0),
+            )
+            # Restore FSM state
+            direction = Direction(pos.get("direction", "BULLISH"))
+            self.fsm.start_signal(direction, 1.0, "Recovered")
+            self.fsm.order_placed(
+                order_id="RECOVERED",
+                security_id=pos.get("security_id", ""),
+                strike_price=pos.get("strike_price", 0),
+                expiry="",
+                quantity=pos.get("quantity", 0),
+            )
+            entry_price = pos.get("entry_price", 0)
+            trailing = self.risk_mgr.create_trailing_state(entry_price)
+            self.fsm.position_opened(entry_price, trailing)
+
+            # Restore trail state
+            if snap.trail_state:
+                self._trail_state = TrailState(
+                    entry_price=snap.trail_state.get("entry_price", entry_price),
+                    sl_price=snap.trail_state.get("sl_price", 0),
+                    peak_price=snap.trail_state.get("peak_price", entry_price),
+                    risk_free=snap.trail_state.get("risk_free", False),
+                    rungs_hit=snap.trail_state.get("rungs_hit", []),
+                )
+            else:
+                self._trail_state = self.trail_engine.create_state(entry_price)
+
+            self.feed.subscribe_option(pos.get("security_id", ""))
+            self.notifier.warning(
+                f"VENOM recovered open position: {pos.get('security_id')}"
+            )
+
+    # ------------------------------------------------------------------
+    # Feed callback
+    # ------------------------------------------------------------------
+
+    def _on_tick(self, message: dict):
+        """WebSocket tick callback — position monitoring done in event loop."""
+        pass
+
+    # ------------------------------------------------------------------
+    # Dashboard
+    # ------------------------------------------------------------------
+
+    def _update_dashboard(self, status: str, vix_mode: str = ""):
+        spot = self.feed.get_ltp(self.inst.security_id) or 0.0
+        trail_text = ""
+        if self._trail_state:
+            trail_text = (
+                f"SL={self._trail_state.sl_price:.2f} "
+                f"Peak={self._trail_state.peak_price:.2f} "
+                f"{'RISK-FREE' if self._trail_state.risk_free else ''}"
+            )
+
+        self.dashboard.update(
+            self.fsm,
+            nifty_price=spot,
+            daily_pnl=self._daily_pnl,
+            trade_count=self._trade_count,
+            system_status=status,
+            vix=self._vix,
+            vix_mode=vix_mode,
+            ohlc_signal=self._ohlc_signal_text,
+            monthly_pnl=self._monthly_pnl,
+            weekly_pnl=self._weekly_pnl,
+            trail_status=trail_text,
+        )
+
+
+# ======================================================================
+# CLI entry point
+# ======================================================================
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VENOM O=H/O=L Scalping Engine")
+    parser.add_argument("--paper", action="store_true", help="Force paper trading mode")
+    parser.add_argument("--config", help="Path to config YAML")
+    args = parser.parse_args()
+
+    config = load_config(yaml_path=args.config)
+
+    if not config.dhan_client_id or not config.dhan_access_token:
+        print("ERROR: Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env")
+        sys.exit(1)
+
+    if args.paper:
+        # Override paper mode
+        from dataclasses import replace
+        config = replace(config, paper_mode=True)
+
+    engine = VenomEngine(config)
+    engine.run()
+
+
+if __name__ == "__main__":
+    main()

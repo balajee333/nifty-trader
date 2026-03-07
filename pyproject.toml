@@ -23,6 +23,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 nifty-trader = "nifty_trader.main:main"
+venom = "nifty_trader.venom:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
