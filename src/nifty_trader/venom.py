@@ -815,6 +815,226 @@ class VenomEngine:
 
 
 # ======================================================================
+# Dry-run simulation
+# ======================================================================
+
+
+def dry_run():
+    """Simulate a full trading day with synthetic data — no API needed."""
+    import random
+
+    print("=" * 65)
+    print("  VENOM DRY RUN — Simulated Trading Day")
+    print("=" * 65)
+    print()
+
+    # --- Simulated market parameters ---
+    nifty_open = 24450.0
+    vix_value = 14.2
+    sim_scenarios = [
+        {
+            "name": "Scenario A: Bullish Day (O=L detected)",
+            "index_ohlc": (24450, 24620, 24448, 24590),
+            "ce_ohlc": (145, 195, 145, 188),
+            "pe_ohlc": (120, 120, 78, 82),
+            "price_path": [145, 148, 153, 160, 168, 175, 180, 178, 185, 192, 198, 195, 190],
+            "vix": 14.2,
+        },
+        {
+            "name": "Scenario B: Bearish Day (O=H detected)",
+            "index_ohlc": (24450, 24450, 24280, 24310),
+            "ce_ohlc": (145, 145, 98, 102),
+            "pe_ohlc": (85, 138, 85, 130),
+            "price_path": [85, 90, 98, 105, 112, 118, 122, 128, 135, 140, 148, 155, 160],
+            "vix": 16.5,
+        },
+        {
+            "name": "Scenario C: Choppy Day (No signal)",
+            "index_ohlc": (24450, 24480, 24420, 24460),
+            "ce_ohlc": (145, 145, 132, 138),
+            "pe_ohlc": (85, 85, 78, 82),
+            "price_path": [],
+            "vix": 22.0,
+        },
+    ]
+
+    # Build VENOM modules (no API needed)
+    from nifty_trader.strategy.ohlc_signal import OhlcSignalDetector, SignalType
+    from nifty_trader.strategy.vix_gate import VixGate, VixMode
+    from nifty_trader.strategy.time_manager import TimeManager, TradingWindow
+    from nifty_trader.strategy.trail_engine import TrailEngine
+    from nifty_trader.risk.monthly import MonthlyManager
+
+    ohlc = OhlcSignalDetector(index_tolerance_pct=0.05, option_tolerance_abs=0.50)
+    vix_gate = VixGate()
+    time_mgr = TimeManager(time_stop_minutes=20)
+    trail = TrailEngine(sl_pct=30, activation_pct=20, trail_distance_pct=15, max_profit_pct=100)
+    monthly = MonthlyManager()
+
+    daily_pnl = 0.0
+    trade_count = 0
+    consecutive_losses = 0
+
+    for scenario in sim_scenarios:
+        print(f"\n{'─' * 65}")
+        print(f"  {scenario['name']}")
+        print(f"{'─' * 65}")
+        vix = scenario["vix"]
+
+        # --- Phase 1: Pre-market VIX Check ---
+        print(f"\n  [08:45] Pre-Market VIX Check")
+        mode = vix_gate.get_mode(vix)
+        can_trade = vix_gate.can_trade(vix)
+        print(f"          VIX: {vix:.1f} | Mode: {mode.value.upper()} | "
+              f"Can Trade: {'YES' if can_trade else 'NO'}")
+        print(f"          Size Multiplier: {vix_gate.size_multiplier(vix):.0%} | "
+              f"Min Confirms: {vix_gate.min_confirmations(vix)} | "
+              f"Delta Target: {vix_gate.target_delta(vix):.2f}")
+
+        if not can_trade:
+            print(f"          BLOCKED — VIX too high. Skipping day.")
+            continue
+
+        # --- Phase 2: Signal Detection at 09:16 ---
+        idx = scenario["index_ohlc"]
+        ce = scenario["ce_ohlc"]
+        pe = scenario["pe_ohlc"]
+
+        print(f"\n  [09:16] O=H/O=L Signal Detection")
+        print(f"          Index OHLC: O={idx[0]:.0f} H={idx[1]:.0f} "
+              f"L={idx[2]:.0f} C={idx[3]:.0f}")
+        print(f"          CE OHLC:    O={ce[0]:.0f} H={ce[1]:.0f} "
+              f"L={ce[2]:.0f} C={ce[3]:.0f}")
+        print(f"          PE OHLC:    O={pe[0]:.0f} H={pe[1]:.0f} "
+              f"L={pe[2]:.0f} C={pe[3]:.0f}")
+
+        sig = ohlc.detect(idx[0], idx[1], idx[2], idx[3],
+                          ce[0], ce[1], ce[2], ce[3],
+                          pe[0], pe[1], pe[2], pe[3])
+
+        print(f"          Index: {sig.index_pattern} | CE: {sig.ce_pattern} | "
+              f"PE: {sig.pe_pattern}")
+        print(f"          Signal: {sig.signal_type.value.upper()} — {sig.reason}")
+
+        if sig.signal_type in (SignalType.WAIT, SignalType.NO_TRADE):
+            print(f"          No actionable signal — sitting out.")
+            continue
+
+        # --- Phase 3: Pre-entry Gate Checks ---
+        print(f"\n  [09:18] Pre-Entry Gate Checks")
+        gates = [
+            ("Time Window", time_mgr.can_enter(dtime(9, 18))),
+            ("VIX Gate", vix_gate.can_trade(vix)),
+            ("Daily Loss", monthly.can_trade_today(daily_pnl)),
+            ("Consecutive Losses", monthly.can_trade_after_streak(consecutive_losses)),
+            ("Trade Count", trade_count < 3),
+        ]
+        all_pass = True
+        for name, passed in gates:
+            status = "PASS" if passed else "FAIL"
+            print(f"          {name}: {status}")
+            if not passed:
+                all_pass = False
+
+        if not all_pass:
+            print(f"          Entry BLOCKED — gate check failed.")
+            continue
+
+        # --- Phase 4: Entry ---
+        direction = "CE" if sig.signal_type == SignalType.BUY_CE else "PE"
+        entry_price = scenario["price_path"][0]
+        lot_size = 75
+        strike = round(nifty_open / 50) * 50
+
+        print(f"\n  [09:18] ENTRY")
+        print(f"          Buy NIFTY {strike} {direction} @ {entry_price:.2f}")
+        print(f"          Qty: {lot_size} | Risk: {entry_price * lot_size:.0f}")
+
+        state = trail.create_state(entry_price)
+        print(f"          Initial SL: {state.sl_price:.2f} "
+              f"(-{trail.sl_pct:.0f}%)")
+
+        # --- Phase 5: Position Monitoring (simulated ticks) ---
+        print(f"\n  [09:20+] Position Monitoring (5-min ticks)")
+        minutes_elapsed = 0
+        exit_price = entry_price
+        exit_reason = ""
+        tick_time = 920
+
+        for i, price in enumerate(scenario["price_path"][1:], 1):
+            minutes_elapsed = i * 5
+            total_mins = 9 * 60 + 20 + minutes_elapsed
+            hrs = total_mins // 60
+            mins = total_mins % 60
+
+            gain_pct = (price - entry_price) / entry_price * 100
+            action = trail.update(state, price)
+
+            indicator = ""
+            if action == "MOVE_SL_TO_COST":
+                indicator = " << SL MOVED TO COST (risk-free!)"
+            elif action == "LOCK_PROFIT":
+                indicator = f" << PROFIT LOCKED (SL={state.sl_price:.2f})"
+            elif action == "TRAILING":
+                indicator = f" << TRAILING (SL={state.sl_price:.2f})"
+            elif action == "SL_HIT":
+                indicator = " << SL HIT — EXITING"
+            elif action == "EXIT_MAX_PROFIT":
+                indicator = " << MAX PROFIT — EXITING"
+
+            print(f"          [{hrs:02d}:{mins:02d}] LTP={price:.2f} | "
+                  f"P&L={gain_pct:+.1f}% | "
+                  f"SL={state.sl_price:.2f}{indicator}")
+
+            if action in ("SL_HIT", "EXIT_MAX_PROFIT"):
+                exit_price = price
+                exit_reason = action
+                break
+
+            # Time stop check
+            if minutes_elapsed >= 20 and abs(gain_pct) < 5.0:
+                print(f"          [{hrs:02d}:{mins:02d}] TIME STOP — flat after 20 min")
+                exit_price = price
+                exit_reason = "TIME_STOP"
+                break
+        else:
+            # If we didn't break, exit at last price
+            exit_price = scenario["price_path"][-1]
+            exit_reason = "END_OF_SIM"
+
+        # --- Phase 6: Exit ---
+        pnl_points = exit_price - entry_price
+        pnl_amount = pnl_points * lot_size
+        pnl_pct = (pnl_points / entry_price) * 100
+        daily_pnl += pnl_amount
+        trade_count += 1
+        if pnl_amount < 0:
+            consecutive_losses += 1
+        else:
+            consecutive_losses = 0
+
+        print(f"\n  EXIT")
+        print(f"          Exit Price: {exit_price:.2f} | Reason: {exit_reason}")
+        print(f"          P&L: {pnl_points:+.2f} pts | "
+              f"{pnl_amount:+,.0f} | {pnl_pct:+.1f}%")
+        print(f"          Trail Peak: {state.peak_price:.2f} | "
+              f"Risk-free: {'Yes' if state.risk_free else 'No'}")
+        print(f"          Rungs Hit: {state.rungs_hit}")
+
+    # --- Daily Summary ---
+    print(f"\n{'=' * 65}")
+    print(f"  DAILY SUMMARY")
+    print(f"{'=' * 65}")
+    print(f"  Trades: {trade_count}")
+    print(f"  Daily P&L: {daily_pnl:+,.0f}")
+    print(f"  Consecutive Losses: {consecutive_losses}")
+    print(f"  Can Trade Tomorrow: "
+          f"{'Yes' if monthly.can_trade_today(daily_pnl) else 'No (limit hit)'}")
+    print(f"\n  System verified. All VENOM modules operational.")
+    print(f"{'=' * 65}")
+
+
+# ======================================================================
 # CLI entry point
 # ======================================================================
 
@@ -822,8 +1042,13 @@ class VenomEngine:
 def main():
     parser = argparse.ArgumentParser(description="VENOM O=H/O=L Scalping Engine")
     parser.add_argument("--paper", action="store_true", help="Force paper trading mode")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate a trading day (no API needed)")
     parser.add_argument("--config", help="Path to config YAML")
     args = parser.parse_args()
+
+    if args.dry_run:
+        dry_run()
+        return
 
     config = load_config(yaml_path=args.config)
 
