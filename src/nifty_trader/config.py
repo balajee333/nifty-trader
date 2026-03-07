@@ -94,6 +94,42 @@ class NotificationConfig:
 
 
 @dataclass(frozen=True)
+class VenomConfig:
+    """VENOM strategy — O=H/O=L scalping with VIX gating."""
+    ohlc_tolerance_index_pct: float = 0.05
+    ohlc_tolerance_option_abs: float = 0.50
+    min_confirmations: int = 3
+    vix_full: float = 13.0
+    vix_selective: float = 18.0
+    vix_caution: float = 23.0
+    vix_restricted: float = 30.0
+    vix_blocked: float = 30.0
+    entry_window_start: str = "09:16"
+    entry_window_end: str = "14:30"
+    no_trade_start: str = "11:30"
+    no_trade_end: str = "13:30"
+    signal_detection_end: str = "09:20"
+    target_delta_low_vix: float = 0.50
+    target_delta_high_vix: float = 0.65
+    max_premium_nifty: float = 265.0
+    max_premium_banknifty: float = 660.0
+    sl_percent: float = 30.0
+    trail_activation_pct: float = 20.0
+    trail_distance_pct: float = 15.0
+    max_profit_pct: float = 100.0
+    time_stop_minutes: int = 20
+    max_trades_per_day: int = 3
+    max_daily_loss: float = 3000.0
+    max_weekly_loss: float = 8000.0
+    consecutive_loss_limit: int = 3
+    mtd_protection_threshold: float = 12000.0
+    mtd_protection_size_reduction: float = 0.30
+    mtd_stop_threshold: float = -5000.0
+    mtd_stop_days: int = 3
+    mtd_resume_size_reduction: float = 0.50
+
+
+@dataclass(frozen=True)
 class SpreadConfig:
     short_delta_min: float = 0.15
     short_delta_max: float = 0.30
@@ -125,6 +161,7 @@ class AppConfig:
     timing: TimingConfig = field(default_factory=TimingConfig)
     data: DataConfig = field(default_factory=DataConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
+    venom: VenomConfig = field(default_factory=VenomConfig)
 
 
 def _make_sub(cls, raw: dict | None):
@@ -174,4 +211,5 @@ def load_config(
         timing=_make_sub(TimingConfig, raw.get("timing")),
         data=_make_sub(DataConfig, raw.get("data")),
         notifications=_make_sub(NotificationConfig, raw.get("notifications")),
+        venom=_make_sub(VenomConfig, raw.get("venom")),
     )

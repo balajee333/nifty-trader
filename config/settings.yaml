@@ -135,3 +135,36 @@ data:
 notifications:
   telegram_enabled: false
   console_enabled: true
+
+venom:
+  ohlc_tolerance_index_pct: 0.05
+  ohlc_tolerance_option_abs: 0.50
+  min_confirmations: 3
+  vix_full: 13.0
+  vix_selective: 18.0
+  vix_caution: 23.0
+  vix_restricted: 30.0
+  vix_blocked: 30.0
+  entry_window_start: "09:16"
+  entry_window_end: "14:30"
+  no_trade_start: "11:30"
+  no_trade_end: "13:30"
+  signal_detection_end: "09:20"
+  target_delta_low_vix: 0.50
+  target_delta_high_vix: 0.65
+  max_premium_nifty: 265.0
+  max_premium_banknifty: 660.0
+  sl_percent: 30.0
+  trail_activation_pct: 20.0
+  trail_distance_pct: 15.0
+  max_profit_pct: 100.0
+  time_stop_minutes: 20
+  max_trades_per_day: 3
+  max_daily_loss: 3000.0
+  max_weekly_loss: 8000.0
+  consecutive_loss_limit: 3
+  mtd_protection_threshold: 12000.0
+  mtd_protection_size_reduction: 0.30
+  mtd_stop_threshold: -5000.0
+  mtd_stop_days: 3
+  mtd_resume_size_reduction: 0.50
