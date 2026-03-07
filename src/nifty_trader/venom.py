@@ -1125,6 +1125,76 @@ def _run_learnings():
     learner.close()
 
 
+def _run_backtest(
+    config_path: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    days: int | None = None,
+):
+    """Run VENOM backtest on historical data."""
+    from datetime import date as _date, timedelta as _td
+    from nifty_trader.backtest.engine import BacktestConfig, VenomBacktester
+    from nifty_trader.backtest.report import BacktestReportGenerator
+
+    config = load_config(yaml_path=config_path)
+
+    if not config.dhan_client_id or not config.dhan_access_token:
+        print("ERROR: Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env")
+        sys.exit(1)
+
+    # Resolve date range
+    if days:
+        end = _date.today()
+        start = end - _td(days=days)
+        start_str = start.strftime("%Y-%m-%d")
+        end_str = end.strftime("%Y-%m-%d")
+    elif from_date and to_date:
+        start_str = from_date
+        end_str = to_date
+    elif from_date:
+        start_str = from_date
+        end_str = _date.today().strftime("%Y-%m-%d")
+    else:
+        # Default: last 30 days
+        end = _date.today()
+        start = end - _td(days=30)
+        start_str = start.strftime("%Y-%m-%d")
+        end_str = end.strftime("%Y-%m-%d")
+
+    bt_config = BacktestConfig(
+        start_date=start_str,
+        end_date=end_str,
+        start_capital=config.risk.capital,
+        lot_size=config.instrument.lot_size,
+        max_trades_per_day=config.venom.max_trades_per_day,
+    )
+
+    dhan = DhanHQ(
+        client_id=config.dhan_client_id,
+        access_token=config.dhan_access_token,
+    )
+    if config.dhan_base_url:
+        dhan.base_url = config.dhan_base_url
+
+    print(f"VENOM Backtest: {start_str} → {end_str}")
+    print("Fetching historical data...")
+
+    backtester = VenomBacktester(dhan, config, bt_config)
+
+    def _progress(current, total, date_str):
+        pct = current / total * 100
+        bar_len = 30
+        filled = int(bar_len * current / total)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        print(f"\r  [{bar}] {pct:.0f}% — Day {current}/{total} ({date_str})", end="", flush=True)
+
+    result = backtester.run(progress_callback=_progress)
+    print()  # newline after progress bar
+
+    report = BacktestReportGenerator()
+    report.print_report(result)
+
+
 def main():
     parser = argparse.ArgumentParser(description="VENOM O=H/O=L Scalping Engine")
     parser.add_argument("--paper", action="store_true", help="Force paper trading mode")
@@ -1133,6 +1203,10 @@ def main():
     parser.add_argument("--eod", action="store_true", help="Run end-of-day analysis")
     parser.add_argument("--dashboard", action="store_true", help="Show goal tracker dashboard")
     parser.add_argument("--learnings", action="store_true", help="Show accumulated trading insights")
+    parser.add_argument("--backtest", action="store_true", help="Run VENOM backtest on historical data")
+    parser.add_argument("--from", dest="from_date", help="Backtest start date (YYYY-MM-DD)")
+    parser.add_argument("--to", dest="to_date", help="Backtest end date (YYYY-MM-DD)")
+    parser.add_argument("--days", type=int, help="Backtest last N calendar days (shorthand)")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -1149,6 +1223,15 @@ def main():
 
     if args.learnings:
         _run_learnings()
+        return
+
+    if args.backtest:
+        _run_backtest(
+            config_path=args.config,
+            from_date=args.from_date,
+            to_date=args.to_date,
+            days=args.days,
+        )
         return
 
     config = load_config(yaml_path=args.config)
