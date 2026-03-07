@@ -1039,15 +1039,116 @@ def dry_run():
 # ======================================================================
 
 
+def _run_eod(config_path: str | None = None):
+    """Run end-of-day analysis — grade trades, update goals, generate report."""
+    from nifty_trader.analysis.eod_analyzer import EODAnalyzer
+    from nifty_trader.analysis.goal_tracker import GoalTracker
+    from nifty_trader.analysis.learning_journal import LearningJournal
+    from nifty_trader.analysis.report_generator import ReportGenerator
+
+    db_path = Path("venom_journal.db")
+    journal = TradeJournal(db_path)
+    analyzer = EODAnalyzer(journal)
+    tracker = GoalTracker(db_path)
+    learner = LearningJournal(db_path)
+
+    # Analyze today
+    analysis = analyzer.analyze()
+
+    # Update goal tracker
+    trades = journal.get_today_trades()
+    pnls = [t.get("pnl", 0) or 0 for t in trades]
+    daily_pnl = sum(pnls)
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p < 0)
+    tracker.update(daily_pnl, len(trades), wins, losses)
+
+    # Auto-generate insights
+    learner.analyze_trades(trades)
+
+    # Build cumulative stats
+    progress = tracker.get_progress()
+    streak = tracker.get_streak()
+    cumulative = {
+        "win_rate": progress.progress_pct,
+        "expectancy": progress.actual_daily_pace,
+    }
+    # Pull real cumulative stats from goal_tracking
+    row = tracker._conn.execute(
+        "SELECT win_rate_cumulative, expectancy FROM goal_tracking ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    if row:
+        cumulative["win_rate"] = row["win_rate_cumulative"]
+        cumulative["expectancy"] = row["expectancy"]
+
+    # Print report
+    report = ReportGenerator()
+    report.print_eod_report(analysis, progress, streak, cumulative)
+
+    journal.close()
+    tracker.close()
+    learner.close()
+
+
+def _run_dashboard():
+    """Show goal tracker dashboard."""
+    from nifty_trader.analysis.goal_tracker import GoalTracker
+    from nifty_trader.analysis.report_generator import ReportGenerator
+
+    db_path = Path("venom_journal.db")
+    tracker = GoalTracker(db_path)
+
+    progress = tracker.get_progress()
+    streak = tracker.get_streak()
+    weekly = tracker.get_weekly_summary()
+    monthly = tracker.get_monthly_summary()
+
+    report = ReportGenerator()
+    report.print_dashboard(progress, streak, weekly, monthly)
+
+    tracker.close()
+
+
+def _run_learnings():
+    """Show accumulated trading insights."""
+    from nifty_trader.analysis.learning_journal import LearningJournal
+    from nifty_trader.analysis.report_generator import ReportGenerator
+
+    db_path = Path("venom_journal.db")
+    learner = LearningJournal(db_path)
+
+    insights = learner.get_insights()
+
+    report = ReportGenerator()
+    report.print_learnings(insights)
+
+    learner.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="VENOM O=H/O=L Scalping Engine")
     parser.add_argument("--paper", action="store_true", help="Force paper trading mode")
     parser.add_argument("--dry-run", action="store_true", help="Simulate a trading day (no API needed)")
     parser.add_argument("--config", help="Path to config YAML")
+    parser.add_argument("--eod", action="store_true", help="Run end-of-day analysis")
+    parser.add_argument("--dashboard", action="store_true", help="Show goal tracker dashboard")
+    parser.add_argument("--learnings", action="store_true", help="Show accumulated trading insights")
     args = parser.parse_args()
 
     if args.dry_run:
         dry_run()
+        return
+
+    if args.eod:
+        _run_eod(config_path=args.config)
+        return
+
+    if args.dashboard:
+        _run_dashboard()
+        return
+
+    if args.learnings:
+        _run_learnings()
         return
 
     config = load_config(yaml_path=args.config)

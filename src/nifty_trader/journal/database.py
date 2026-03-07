@@ -61,6 +61,38 @@ CREATE TABLE IF NOT EXISTS system_events (
     message TEXT,
     details TEXT
 );
+
+CREATE TABLE IF NOT EXISTS goal_tracking (
+    date TEXT PRIMARY KEY,
+    starting_capital REAL,
+    current_capital REAL,
+    daily_pnl REAL,
+    cumulative_pnl REAL,
+    trades_today INTEGER,
+    wins_today INTEGER,
+    losses_today INTEGER,
+    win_rate_cumulative REAL,
+    avg_winner REAL,
+    avg_loser REAL,
+    expectancy REAL,
+    max_drawdown REAL,
+    days_elapsed INTEGER,
+    days_remaining INTEGER,
+    required_daily_pace REAL,
+    actual_daily_pace REAL,
+    on_track INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS learnings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT,
+    category TEXT,
+    insight TEXT,
+    confidence TEXT DEFAULT 'observed',
+    occurrences INTEGER DEFAULT 1,
+    last_seen TEXT,
+    pnl_impact REAL DEFAULT 0.0
+);
 """
 
 
