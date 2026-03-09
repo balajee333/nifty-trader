@@ -27,34 +27,47 @@ class OhlcSignal:
 
 
 class OhlcSignalDetector:
-    """Detect O=H / O=L patterns across index + option candles."""
+    """Detect O=H / O=L patterns across index + option candles.
+
+    Tolerance is measured as a fraction of the candle's range (H-L),
+    not of the open price.  For a 100-point range with 5 % tolerance,
+    the open must be within 5 points of the high or low.
+    """
 
     def __init__(
         self,
-        index_tolerance_pct: float = 0.05,
-        option_tolerance_abs: float = 0.50,
+        index_tolerance_pct: float = 5.0,
+        option_tolerance_abs: float = 2.0,
     ):
+        # index_tolerance_pct: max (O-H)/(H-L) or (O-L)/(H-L) as a %
         self._idx_tol = index_tolerance_pct / 100.0
+        # option_tolerance_abs: kept as absolute Rs for option premiums
         self._opt_tol = option_tolerance_abs
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _is_open_eq_high(self, open_p: float, high: float, is_index: bool) -> bool:
+    def _is_open_eq_high(self, open_p: float, high: float, low: float, is_index: bool) -> bool:
         if is_index:
-            return (high - open_p) <= open_p * self._idx_tol
+            rng = high - low
+            if rng <= 0:
+                return False
+            return (high - open_p) / rng <= self._idx_tol
         return (high - open_p) <= self._opt_tol
 
-    def _is_open_eq_low(self, open_p: float, low: float, is_index: bool) -> bool:
+    def _is_open_eq_low(self, open_p: float, high: float, low: float, is_index: bool) -> bool:
         if is_index:
-            return (open_p - low) <= open_p * self._idx_tol
+            rng = high - low
+            if rng <= 0:
+                return False
+            return (open_p - low) / rng <= self._idx_tol
         return (open_p - low) <= self._opt_tol
 
     def _pattern(self, open_p: float, high: float, low: float, is_index: bool) -> str:
-        if self._is_open_eq_high(open_p, high, is_index):
+        if self._is_open_eq_high(open_p, high, low, is_index):
             return "O=H"
-        if self._is_open_eq_low(open_p, low, is_index):
+        if self._is_open_eq_low(open_p, high, low, is_index):
             return "O=L"
         return "MID"
 

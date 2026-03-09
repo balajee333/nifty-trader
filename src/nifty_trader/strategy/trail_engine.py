@@ -21,9 +21,9 @@ class TrailEngine:
         self.trail_distance_pct = trail_distance_pct
         self.max_profit_pct = max_profit_pct
         self._rungs = [
-            (20, 0),     # +20% gain -> SL at cost (0% gain locked)
-            (40, 20),    # +40% gain -> SL at +20%
-            (70, 45),    # +70% gain -> SL at +45%
+            (12, 0),     # +12% gain -> SL at cost (risk-free)
+            (25, 12),    # +25% gain -> SL at +12%
+            (50, 30),    # +50% gain -> SL at +30%
         ]
 
     def create_state(self, entry_price: float) -> TrailState:

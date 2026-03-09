@@ -71,7 +71,7 @@ strategy:
   rsi_bearish_entry: 65
   rsi_oversold: 30
   rsi_overbought: 70
-  vwap_confirm_candles: 3
+  vwap_confirm_candles: 2
   volume_spike_multiplier: 1.5
   volume_sma_period: 20
   level_proximity_pct: 0.3
@@ -137,8 +137,8 @@ notifications:
   console_enabled: true
 
 venom:
-  ohlc_tolerance_index_pct: 0.05
-  ohlc_tolerance_option_abs: 0.50
+  ohlc_tolerance_index_pct: 5.0
+  ohlc_tolerance_option_abs: 2.0
   min_confirmations: 3
   vix_full: 13.0
   vix_selective: 18.0
@@ -155,10 +155,10 @@ venom:
   max_premium_nifty: 265.0
   max_premium_banknifty: 660.0
   sl_percent: 30.0
-  trail_activation_pct: 20.0
+  trail_activation_pct: 12.0
   trail_distance_pct: 15.0
   max_profit_pct: 100.0
-  time_stop_minutes: 20
+  time_stop_minutes: 45
   max_trades_per_day: 3
   max_daily_loss: 3000.0
   max_weekly_loss: 8000.0

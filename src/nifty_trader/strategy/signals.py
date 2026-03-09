@@ -76,7 +76,19 @@ def evaluate_vwap(df: pd.DataFrame, cfg: StrategyConfig) -> SignalResult:
 
 
 def evaluate_rsi(df: pd.DataFrame, cfg: StrategyConfig) -> SignalResult:
-    """RSI reversal signal."""
+    """RSI reversal signal.
+
+    Returns NEUTRAL when fewer than ``rsi_period + 1`` candles are
+    available, since RSI needs at least that many data points to
+    produce a meaningful value (otherwise it pegs to 0 or 100).
+    """
+    min_candles = cfg.rsi_period + 1
+    if len(df) < min_candles:
+        return SignalResult(
+            "rsi", Direction.NEUTRAL, 0.0,
+            f"RSI needs {min_candles} candles, have {len(df)}",
+        )
+
     rsi_vals = rsi(df["close"], cfg.rsi_period)
     if rsi_vals.isna().all():
         return SignalResult("rsi", Direction.NEUTRAL, 0.0, "Insufficient RSI data")
@@ -100,18 +112,32 @@ def evaluate_rsi(df: pd.DataFrame, cfg: StrategyConfig) -> SignalResult:
 
 
 def evaluate_volume(df: pd.DataFrame, cfg: StrategyConfig) -> SignalResult:
-    """Volume spike with directional candle."""
-    spike = is_volume_spike(df["volume"], cfg.volume_sma_period, cfg.volume_spike_multiplier)
-    if not spike.iloc[-1]:
+    """Volume confirmation — compares recent candle volume to session average.
+
+    With only a few early candles, a 20-period SMA is meaningless.
+    Instead, compare the latest candle's volume to the average of the
+    available candles.  A spike with a directional candle confirms bias.
+    """
+    if len(df) < 2 or df["volume"].sum() == 0:
+        return SignalResult("volume", Direction.NEUTRAL, 0.0, "No volume data")
+
+    avg_vol = df["volume"].mean()
+    last_vol = df["volume"].iloc[-1]
+    multiplier = cfg.volume_spike_multiplier
+
+    if avg_vol <= 0 or last_vol <= avg_vol * multiplier:
         return SignalResult("volume", Direction.NEUTRAL, 0.0, "No volume spike")
 
     green = is_green_candle(df["open"], df["close"]).iloc[-1]
     red = is_red_candle(df["open"], df["close"]).iloc[-1]
+    ratio = last_vol / avg_vol
 
     if green:
-        return SignalResult("volume", Direction.BULLISH, 1.0, "Green candle + volume spike")
+        return SignalResult("volume", Direction.BULLISH, 1.0,
+                            f"Green candle + {ratio:.1f}x volume spike")
     if red:
-        return SignalResult("volume", Direction.BEARISH, 1.0, "Red candle + volume spike")
+        return SignalResult("volume", Direction.BEARISH, 1.0,
+                            f"Red candle + {ratio:.1f}x volume spike")
 
     return SignalResult("volume", Direction.NEUTRAL, 0.0, "Volume spike but doji candle")
 
