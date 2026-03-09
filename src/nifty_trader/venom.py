@@ -18,6 +18,7 @@ from pathlib import Path
 from dhanhq import dhanhq as DhanHQ
 
 from nifty_trader.alerts.notifier import Notifier
+from nifty_trader.pages.publisher import JournalPublisher
 from nifty_trader.config import AppConfig, load_config
 from nifty_trader.constants import Direction, OptionType, TradeState
 from nifty_trader.core.persister import StatePersister, VenomSnapshot
@@ -147,6 +148,7 @@ class VenomEngine:
             mtd_resume_size_reduction=self.vcfg.mtd_resume_size_reduction,
         )
         self.persister = StatePersister()
+        self._journal_publisher = JournalPublisher()
 
         # ------- Runtime state -------
         self._vix: float = 0.0
@@ -160,8 +162,24 @@ class VenomEngine:
         self._level_detector: LevelDetector | None = None
         self._signal_detected: bool = False
         self._signal_attempt_done: bool = False
+        self._time_offset: timedelta | None = None
         self._weekly_pnl: float = 0.0
         self._monthly_pnl: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Time simulation
+    # ------------------------------------------------------------------
+
+    def set_time_offset(self, offset):
+        """Shift the engine's clock by a timedelta for simulation."""
+        self._time_offset = offset
+
+    def _now(self) -> datetime:
+        """Return current time, adjusted by simulation offset if set."""
+        now = datetime.now()
+        if self._time_offset:
+            now = now + self._time_offset
+        return now
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -203,6 +221,14 @@ class VenomEngine:
         self.feed.stop()
         self.persister.clear()
         self.dashboard.stop()
+
+        # Publish daily journal to GitHub Pages
+        try:
+            self._journal_publisher.collect_day_data(self)
+            self._journal_publisher.publish()
+        except Exception:
+            logger.exception("Failed to publish journal")
+
         self.journal.close()
         self.notifier.info("VENOM stopped")
         logger.info("VENOM shutdown complete")
@@ -252,7 +278,7 @@ class VenomEngine:
         _STATUS_INTERVAL = 30  # log key info every 30 seconds
 
         while self._running:
-            now = datetime.now()
+            now = self._now()
             now_time = now.time()
             window = self.time_mgr.get_window(now_time)
 
@@ -359,7 +385,7 @@ class VenomEngine:
 
     def _pre_entry_checks(self) -> bool:
         """Run all gates before allowing an entry. Returns True if clear."""
-        now_time = datetime.now().time()
+        now_time = self._now().time()
 
         # Time window
         if not self.time_mgr.can_enter(now_time):
@@ -1251,6 +1277,7 @@ def main():
     parser.add_argument("--from", dest="from_date", help="Backtest start date (YYYY-MM-DD)")
     parser.add_argument("--to", dest="to_date", help="Backtest end date (YYYY-MM-DD)")
     parser.add_argument("--days", type=int, help="Backtest last N calendar days (shorthand)")
+    parser.add_argument("--sim-start", help="Simulate starting at HH:MM (e.g. 09:10) — shifts engine clock")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -1290,6 +1317,14 @@ def main():
         config = replace(config, paper_mode=True)
 
     engine = VenomEngine(config)
+
+    if args.sim_start:
+        h, m = map(int, args.sim_start.split(":"))
+        sim_target = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+        offset = sim_target - datetime.now()
+        engine.set_time_offset(offset)
+        logger.info("Time simulation: engine clock offset by %s (simulated start %s)", offset, args.sim_start)
+
     engine.run()
 
 
