@@ -75,7 +75,7 @@ strategy:
   volume_spike_multiplier: 1.5
   volume_sma_period: 20
   level_proximity_pct: 0.3
-  confluence_min_score: 2.0
+  confluence_min_score: 1.5
   signal_weights:
     ema: 1.0
     vwap: 0.8
