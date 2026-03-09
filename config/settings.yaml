@@ -8,7 +8,7 @@ instrument:
   exchange_segment: "NSE_FNO"
   spot_exchange_segment: "IDX_I"
   instrument_type: "INDEX"
-  lot_size: 25
+  lot_size: 75
   feed_code: 0
   market_open: "09:15"
   market_close: "15:30"

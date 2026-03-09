@@ -1,7 +1,8 @@
 """Option premium simulator — approximate ATM premium path from index candles + VIX.
 
-Since DhanHQ doesn't provide historical option candles, we simulate
-CE/PE premiums from the underlying index candle data and VIX level.
+Fallback simulator used when real option candles are unavailable (e.g.
+expired contracts no longer in the scrip master). For recent dates, the
+backtester can fetch real CE/PE candles via --real-options flag.
 """
 
 from __future__ import annotations

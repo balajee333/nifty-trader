@@ -1380,6 +1380,7 @@ def _run_backtest(
     from_date: str | None = None,
     to_date: str | None = None,
     days: int | None = None,
+    real_options: bool = False,
 ):
     """Run VENOM backtest on historical data."""
     from datetime import date as _date, timedelta as _td
@@ -1417,6 +1418,7 @@ def _run_backtest(
         start_capital=config.risk.capital,
         lot_size=config.instrument.lot_size,
         max_trades_per_day=config.venom.max_trades_per_day,
+        use_real_options=real_options,
     )
 
     dhan = DhanHQ(
@@ -1426,7 +1428,8 @@ def _run_backtest(
     if config.dhan_base_url:
         dhan.base_url = config.dhan_base_url
 
-    print(f"VENOM Backtest: {start_str} → {end_str}")
+    mode_label = "REAL OPTIONS" if real_options else "SIMULATED"
+    print(f"VENOM Backtest [{mode_label}]: {start_str} → {end_str}")
     print("Fetching historical data...")
 
     backtester = VenomBacktester(dhan, config, bt_config)
@@ -1457,6 +1460,7 @@ def main():
     parser.add_argument("--from", dest="from_date", help="Backtest start date (YYYY-MM-DD)")
     parser.add_argument("--to", dest="to_date", help="Backtest end date (YYYY-MM-DD)")
     parser.add_argument("--days", type=int, help="Backtest last N calendar days (shorthand)")
+    parser.add_argument("--real-options", action="store_true", help="Use real option candles from DhanHQ (limited to recent contracts)")
     parser.add_argument("--sim-start", help="Simulate starting at HH:MM (e.g. 09:10) — shifts engine clock")
     args = parser.parse_args()
 
@@ -1482,6 +1486,7 @@ def main():
             from_date=args.from_date,
             to_date=args.to_date,
             days=args.days,
+            real_options=args.real_options,
         )
         return
 

@@ -35,7 +35,8 @@ class BacktestReportGenerator:
         header = Text()
         header.append("VENOM BACKTEST REPORT\n", style="bold cyan")
         header.append(f"Period: {cfg.start_date} → {cfg.end_date}\n")
-        header.append(f"Capital: {cfg.start_capital:,.0f} | Lot Size: {cfg.lot_size}\n")
+        data_mode = "REAL OPTIONS" if cfg.use_real_options else "SIMULATED"
+        header.append(f"Capital: {cfg.start_capital:,.0f} | Lot Size: {cfg.lot_size} | Data: {data_mode}\n")
         header.append(f"Trading Days: {len(result.days)} | Trades: {result.total_trades}")
         self._console.print(Panel(header, border_style="cyan"))
 
