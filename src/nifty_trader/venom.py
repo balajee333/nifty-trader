@@ -52,7 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # India VIX security ID on DhanHQ
-VIX_SECURITY_ID = "26"
+VIX_SECURITY_ID = "21"
 
 
 class VenomEngine:
@@ -104,9 +104,11 @@ class VenomEngine:
         self.hist_fetcher = HistoricalDataFetcher(
             self.dhan, config.data.rate_limit_data_per_sec,
         )
+        # Option chain API uses the spot exchange segment (IDX_I for index
+        # options), not the FNO segment.
         self.chain_fetcher = OptionChainFetcher(
             self.dhan, config.data.rate_limit_option_chain_sec,
-            exchange_segment=self.inst.exchange_segment,
+            exchange_segment=self.inst.spot_exchange_segment,
         )
         self.feed = MarketFeedManager(
             self.dhan,
@@ -157,6 +159,7 @@ class VenomEngine:
         self._recent_pnls: list[float] = []
         self._level_detector: LevelDetector | None = None
         self._signal_detected: bool = False
+        self._signal_attempt_done: bool = False
         self._weekly_pnl: float = 0.0
         self._monthly_pnl: float = 0.0
 
@@ -245,6 +248,8 @@ class VenomEngine:
 
     def _event_loop(self):
         tick_interval = self.cfg.timing.tick_interval_sec
+        self._last_status_log = 0.0
+        _STATUS_INTERVAL = 30  # log key info every 30 seconds
 
         while self._running:
             now = datetime.now()
@@ -273,13 +278,21 @@ class VenomEngine:
                 break
 
             # Signal detection window (9:16-9:20): detect O=H/O=L
-            if not self._signal_detected and self.time_mgr.can_enter(now_time):
+            # Also catch up on signal detection if started late (past the
+            # signal window but still in a valid entry window).
+            if not self._signal_detected and not self._signal_attempt_done and self.time_mgr.can_enter(now_time):
                 entry_start = self.vcfg.entry_window_start.split(":")
                 signal_end = self.vcfg.signal_detection_end.split(":")
+                signal_end_time = dtime(int(signal_end[0]), int(signal_end[1]))
                 if (dtime(int(entry_start[0]), int(entry_start[1]))
                         <= now_time
-                        < dtime(int(signal_end[0]), int(signal_end[1]))):
+                        < signal_end_time):
                     self._detect_ohlc_signal()
+                elif now_time >= signal_end_time:
+                    # Late start — run signal detection from first candle
+                    logger.info("Late start catch-up: running signal detection now")
+                    self._detect_ohlc_signal()
+                    self._signal_attempt_done = True
 
             # Entry logic — scan for trades when idle + signal present
             if (self.fsm.is_idle
@@ -309,6 +322,34 @@ class VenomEngine:
                 f"Window: {window.value}",
                 vix_mode=vix_mode.value,
             )
+
+            # Periodic console status line
+            elapsed_since_log = time.monotonic() - self._last_status_log
+            if elapsed_since_log >= _STATUS_INTERVAL:
+                self._last_status_log = time.monotonic()
+                spot = self.feed.get_ltp(self.inst.security_id) or 0.0
+                state = self.fsm.state.value if hasattr(self.fsm, 'state') else "?"
+                pos_info = ""
+                if self.fsm.has_position and self.fsm.ctx.entry_price > 0:
+                    ltp = self.feed.get_ltp(self.fsm.ctx.security_id) or 0
+                    pnl = (ltp - self.fsm.ctx.entry_price) * self.fsm.ctx.quantity
+                    pos_info = (
+                        f" | Position: {self.fsm.ctx.security_id} "
+                        f"Entry={self.fsm.ctx.entry_price:.2f} LTP={ltp:.2f} "
+                        f"P&L={pnl:+,.0f}"
+                    )
+                    if self._trail_state:
+                        pos_info += f" SL={self._trail_state.sl_price:.2f}"
+                        if self._trail_state.risk_free:
+                            pos_info += " [RISK-FREE]"
+                logger.info(
+                    "[%s] Nifty=%.2f VIX=%.2f Mode=%s Window=%s "
+                    "Signal=%s DayP&L=%.0f Trades=%d%s",
+                    now.strftime("%H:%M:%S"),
+                    spot, self._vix, vix_mode.value, window.value,
+                    self._ohlc_signal_text or "none",
+                    self._daily_pnl, self._trade_count, pos_info,
+                )
 
             time.sleep(tick_interval)
 
@@ -388,54 +429,57 @@ class VenomEngine:
                 return
 
             # Get ATM option chain for CE/PE candles
-            expiry = self.chain_fetcher.nearest_weekly_expiry(self.inst.security_id)
-            if not expiry:
-                logger.warning("No expiry for O=H/O=L option candles")
-                return
+            ce_ohlc = pe_ohlc = None
+            try:
+                expiry = self.chain_fetcher.nearest_weekly_expiry(self.inst.security_id)
+                if expiry:
+                    contracts = self.chain_fetcher.get_chain(expiry, self.inst.security_id)
+                    if contracts:
+                        spot = idx_close
+                        atm_strike = round(spot / 50) * 50
 
-            contracts = self.chain_fetcher.get_chain(expiry, self.inst.security_id)
-            if not contracts:
-                return
+                        atm_ce = next(
+                            (c for c in contracts
+                             if c.option_type == OptionType.CALL
+                             and abs(c.strike_price - atm_strike) < 1),
+                            None,
+                        )
+                        atm_pe = next(
+                            (c for c in contracts
+                             if c.option_type == OptionType.PUT
+                             and abs(c.strike_price - atm_strike) < 1),
+                            None,
+                        )
+                        if atm_ce and atm_pe:
+                            ce_price = atm_ce.ltp or atm_ce.mid_price
+                            pe_price = atm_pe.ltp or atm_pe.mid_price
+                            ce_ohlc = (ce_price, ce_price * 1.01, ce_price * 0.99, ce_price)
+                            pe_ohlc = (pe_price, pe_price * 1.01, pe_price * 0.99, pe_price)
+            except Exception:
+                logger.debug("Option chain fetch failed, using simulated option patterns")
 
-            # Find ATM CE and PE
-            spot = idx_close
-            atm_strike = round(spot / 50) * 50  # Round to nearest 50
-
-            atm_ce = next(
-                (c for c in contracts
-                 if c.option_type == OptionType.CALL
-                 and abs(c.strike_price - atm_strike) < 1),
-                None,
-            )
-            atm_pe = next(
-                (c for c in contracts
-                 if c.option_type == OptionType.PUT
-                 and abs(c.strike_price - atm_strike) < 1),
-                None,
-            )
-
-            if not atm_ce or not atm_pe:
-                logger.warning("ATM CE/PE not found for strike %.0f", atm_strike)
-                return
-
-            # Use LTP as proxy for the first candle OHLC of options
-            # (In practice, you'd fetch 5-min option candles too)
-            ce_price = atm_ce.ltp or atm_ce.mid_price
-            pe_price = atm_pe.ltp or atm_pe.mid_price
+            # Fallback: simulate CE/PE patterns from index candle
+            if not ce_ohlc or not pe_ohlc:
+                from nifty_trader.backtest.simulator import PremiumSimulator
+                sim = PremiumSimulator()
+                opts = sim.simulate_option_ohlc_from_index(idx_open, idx_high, idx_low, idx_close)
+                ce_ohlc = (opts["ce_open"], opts["ce_high"], opts["ce_low"], opts["ce_close"])
+                pe_ohlc = (opts["pe_open"], opts["pe_high"], opts["pe_low"], opts["pe_close"])
+                logger.info("Using simulated option patterns for O=H/O=L detection")
 
             sig = self.ohlc_detector.detect(
                 index_open=idx_open,
                 index_high=idx_high,
                 index_low=idx_low,
                 index_close=idx_close,
-                ce_open=ce_price,
-                ce_high=ce_price * 1.01,  # approximate from chain snapshot
-                ce_low=ce_price * 0.99,
-                ce_close=ce_price,
-                pe_open=pe_price,
-                pe_high=pe_price * 1.01,
-                pe_low=pe_price * 0.99,
-                pe_close=pe_price,
+                ce_open=ce_ohlc[0],
+                ce_high=ce_ohlc[1],
+                ce_low=ce_ohlc[2],
+                ce_close=ce_ohlc[3],
+                pe_open=pe_ohlc[0],
+                pe_high=pe_ohlc[1],
+                pe_low=pe_ohlc[2],
+                pe_close=pe_ohlc[3],
             )
 
             self._ohlc_signal_text = f"{sig.signal_type.value}: {sig.reason}"

@@ -74,8 +74,17 @@ class OptionChainFetcher:
                 under_exchange_segment=self._exchange_segment,
             )
             if resp and resp.get("status") == "success":
-                self._cached_expiries = sorted(resp.get("data", []))
-                self._expiry_fetched_at = time.monotonic()
+                data = resp.get("data", {})
+                # DhanHQ v2 nests the list inside data.data
+                if isinstance(data, dict):
+                    expiry_list = data.get("data", [])
+                elif isinstance(data, list):
+                    expiry_list = data
+                else:
+                    expiry_list = []
+                if isinstance(expiry_list, list):
+                    self._cached_expiries = sorted(expiry_list)
+                    self._expiry_fetched_at = time.monotonic()
         except Exception:
             logger.exception("Failed to fetch expiry list")
 
@@ -111,30 +120,78 @@ class OptionChainFetcher:
             logger.warning("Option chain API non-success: %s", resp)
             return []
 
+        raw_data = resp.get("data", {})
+        # DhanHQ v2: data is nested — {"data": {"last_price": ..., "oc": {strike: {ce: ..., pe: ...}}}}
+        if isinstance(raw_data, dict):
+            inner = raw_data.get("data", raw_data)
+            if isinstance(inner, dict):
+                oc = inner.get("oc", {})
+            else:
+                oc = {}
+        elif isinstance(raw_data, list):
+            # Legacy flat list format
+            oc = None
+        else:
+            return []
+
         contracts: list[OptionContract] = []
-        for row in resp.get("data", []):
-            for side in ("ce", "pe"):
-                entry = row.get(side)
-                if not entry:
-                    continue
+
+        if oc is not None:
+            # v2 dict format: {strike_str: {"ce": {...}, "pe": {...}}}
+            for strike_str, sides in oc.items():
                 try:
-                    contracts.append(OptionContract(
-                        security_id=str(entry.get("security_id", "")),
-                        strike_price=float(row.get("strike_price", 0)),
-                        option_type=OptionType.CALL if side == "ce" else OptionType.PUT,
-                        expiry=expiry,
-                        ltp=float(entry.get("ltp", 0)),
-                        bid=float(entry.get("bid", 0)),
-                        ask=float(entry.get("ask", 0)),
-                        volume=int(entry.get("volume", 0)),
-                        oi=int(entry.get("oi", 0)),
-                        delta=float(entry.get("delta", 0)),
-                        theta=float(entry.get("theta", 0)),
-                        gamma=float(entry.get("gamma", 0)),
-                        vega=float(entry.get("vega", 0)),
-                        iv=float(entry.get("iv", 0)),
-                    ))
+                    strike_price = float(strike_str)
                 except (ValueError, TypeError):
                     continue
+                for side in ("ce", "pe"):
+                    entry = sides.get(side)
+                    if not entry:
+                        continue
+                    greeks = entry.get("greeks", {})
+                    try:
+                        contracts.append(OptionContract(
+                            security_id=str(entry.get("security_id", "")),
+                            strike_price=strike_price,
+                            option_type=OptionType.CALL if side == "ce" else OptionType.PUT,
+                            expiry=expiry,
+                            ltp=float(entry.get("last_price", 0)),
+                            bid=float(entry.get("top_bid_price", 0)),
+                            ask=float(entry.get("top_ask_price", 0)),
+                            volume=int(entry.get("volume", 0)),
+                            oi=int(entry.get("oi", 0)),
+                            delta=float(greeks.get("delta", 0)),
+                            theta=float(greeks.get("theta", 0)),
+                            gamma=float(greeks.get("gamma", 0)),
+                            vega=float(greeks.get("vega", 0)),
+                            iv=float(entry.get("implied_volatility", 0)),
+                        ))
+                    except (ValueError, TypeError):
+                        continue
+        else:
+            # Legacy flat list format
+            for row in raw_data:
+                for side in ("ce", "pe"):
+                    entry = row.get(side)
+                    if not entry:
+                        continue
+                    try:
+                        contracts.append(OptionContract(
+                            security_id=str(entry.get("security_id", "")),
+                            strike_price=float(row.get("strike_price", 0)),
+                            option_type=OptionType.CALL if side == "ce" else OptionType.PUT,
+                            expiry=expiry,
+                            ltp=float(entry.get("ltp", 0)),
+                            bid=float(entry.get("bid", 0)),
+                            ask=float(entry.get("ask", 0)),
+                            volume=int(entry.get("volume", 0)),
+                            oi=int(entry.get("oi", 0)),
+                            delta=float(entry.get("delta", 0)),
+                            theta=float(entry.get("theta", 0)),
+                            gamma=float(entry.get("gamma", 0)),
+                            vega=float(entry.get("vega", 0)),
+                            iv=float(entry.get("iv", 0)),
+                        ))
+                    except (ValueError, TypeError):
+                        continue
 
         return contracts

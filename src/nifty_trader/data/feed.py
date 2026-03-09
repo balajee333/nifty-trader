@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -18,9 +19,9 @@ logger = logging.getLogger(__name__)
 class MarketFeedManager:
     """Manages DhanHQ WebSocket market feed with heartbeat and reconnect.
 
-    Uses DhanFeed (v2.0.x) which provides:
-      - DhanFeed(client_id, access_token, instruments) to connect
-      - get_data() to poll latest tick
+    Uses DhanFeed (v2) which provides:
+      - DhanFeed(client_id, access_token, instruments, version='v2') to connect
+      - get_data() to receive next tick (calls ws.recv())
       - subscribe_symbols() / unsubscribe_symbols() for dynamic subscriptions
     Instruments format: list of (exchange_segment_code, security_id, feed_type)
     where feed_type: Ticker=15, Quote=17, Full=21
@@ -41,7 +42,7 @@ class MarketFeedManager:
         self._last_tick_time: float = 0.0
         self._running = False
         self._feed = None
-        self._poll_thread: threading.Thread | None = None
+        self._ws_thread: threading.Thread | None = None
         self._subscriptions: list[tuple[int, str, int]] = []  # (exchange_code, security_id, feed_type)
         self._latest_ltp: dict[str, float] = {}
 
@@ -71,7 +72,7 @@ class MarketFeedManager:
         self._subscriptions.append((feed_code, security_id, self.QUOTE))
 
     def start(self):
-        """Start the WebSocket feed and polling thread."""
+        """Start the WebSocket feed with a receive loop in a background thread."""
         if self._running:
             return
 
@@ -81,59 +82,62 @@ class MarketFeedManager:
         try:
             from dhanhq.marketfeed import DhanFeed
 
-            # DhanFeed expects instruments as list of (exchange_code, security_id, feed_type) tuples
             self._feed = DhanFeed(
                 client_id=self._dhan.client_id,
                 access_token=self._dhan.access_token,
                 instruments=self._subscriptions,
+                version="v2",
             )
 
-            # Start WebSocket connection in background
-            ws_thread = threading.Thread(target=self._run_feed, daemon=True)
-            ws_thread.start()
-
-            # Start polling thread to fetch data
-            self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
-            self._poll_thread.start()
+            # Run connect + recv loop in a dedicated thread with its own event loop
+            self._ws_thread = threading.Thread(target=self._run_ws_loop, daemon=True)
+            self._ws_thread.start()
 
         except Exception:
             logger.exception("Failed to start MarketFeed")
             self._running = False
 
-    def _run_feed(self):
-        """Run the WebSocket event loop."""
+    def _run_ws_loop(self):
+        """Connect, then continuously receive and process ticks."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Replace the feed's event loop with ours so get_data() works
+        self._feed.loop = loop
+
         try:
-            self._feed.run_forever()
+            # Connect + subscribe
+            loop.run_until_complete(self._feed.connect())
+            logger.info("MarketFeed WebSocket connected (v2)")
+
+            # Continuous receive loop
+            loop.run_until_complete(self._recv_loop())
         except Exception:
             logger.exception("MarketFeed WebSocket error")
+        finally:
             self._running = False
+            loop.close()
 
-    def _poll_loop(self):
-        """Poll for new tick data periodically."""
-        import asyncio
-
-        loop = asyncio.new_event_loop()
+    async def _recv_loop(self):
+        """Continuously receive data from the WebSocket."""
         while self._running:
             try:
-                # get_data() internally calls run_until_complete on an async method
-                # but it may fail if the feed's loop is already running in another thread.
-                # Use the feed's data attribute directly if available.
-                if hasattr(self._feed, 'data') and self._feed.data:
-                    data = self._feed.data
-                    self._feed.data = ""
-                    if data:
-                        self._last_tick_time = time.monotonic()
-                        self._process_tick(data)
-            except Exception:
-                pass  # Feed not ready yet or disconnected
-
-            # Check heartbeat
-            elapsed = time.monotonic() - self._last_tick_time
-            if elapsed > self._heartbeat_timeout:
+                data = await asyncio.wait_for(
+                    self._feed.ws.recv(),
+                    timeout=self._heartbeat_timeout,
+                )
+                parsed = self._feed.process_data(data)
+                if parsed:
+                    self._last_tick_time = time.monotonic()
+                    self._process_tick(parsed)
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - self._last_tick_time
                 logger.warning("No tick for %.0fs — feed may be disconnected", elapsed)
-
-            time.sleep(1)
-        loop.close()
+            except Exception as exc:
+                if not self._running:
+                    break
+                logger.warning("WebSocket recv error: %s", exc)
+                await asyncio.sleep(1)
 
     def stop(self):
         self._running = False

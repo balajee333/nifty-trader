@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # India VIX security ID on DhanHQ
-VIX_SECURITY_ID = "26"
+VIX_SECURITY_ID = "21"
 
 # DhanHQ historical API max range is 90 calendar days
 _CHUNK_DAYS = 89
