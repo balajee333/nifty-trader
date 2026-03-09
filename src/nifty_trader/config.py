@@ -18,7 +18,7 @@ class InstrumentConfig:
     exchange_segment: str = "NSE_FNO"
     spot_exchange_segment: str = "IDX_I"
     instrument_type: str = "INDEX"
-    lot_size: int = 25
+    lot_size: int = 75
     feed_code: int = 0          # DhanHQ MarketFeed: 0=IDX, 5=MCX
     market_open: str = "09:15"
     market_close: str = "15:30"
@@ -37,7 +37,7 @@ class StrategyConfig:
     volume_spike_multiplier: float = 1.5
     volume_sma_period: int = 20
     level_proximity_pct: float = 0.3
-    confluence_min_score: float = 2.0
+    confluence_min_score: float = 2.5
     signal_weights: dict = field(default_factory=lambda: {
         "ema": 1.0, "vwap": 0.8, "rsi": 0.7, "volume": 0.5, "levels": 0.5,
     })
@@ -96,8 +96,8 @@ class NotificationConfig:
 @dataclass(frozen=True)
 class VenomConfig:
     """VENOM strategy — O=H/O=L scalping with VIX gating."""
-    ohlc_tolerance_index_pct: float = 0.05
-    ohlc_tolerance_option_abs: float = 0.50
+    ohlc_tolerance_index_pct: float = 0.10
+    ohlc_tolerance_option_abs: float = 1.00
     min_confirmations: int = 3
     vix_full: float = 13.0
     vix_selective: float = 18.0
@@ -117,7 +117,7 @@ class VenomConfig:
     trail_activation_pct: float = 20.0
     trail_distance_pct: float = 15.0
     max_profit_pct: float = 100.0
-    time_stop_minutes: int = 20
+    time_stop_minutes: int = 15
     max_trades_per_day: int = 3
     max_daily_loss: float = 3000.0
     max_weekly_loss: float = 8000.0

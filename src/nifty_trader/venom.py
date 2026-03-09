@@ -165,6 +165,7 @@ class VenomEngine:
         self._time_offset: timedelta | None = None
         self._weekly_pnl: float = 0.0
         self._monthly_pnl: float = 0.0
+        self._day_events: list[dict] = []
 
     # ------------------------------------------------------------------
     # Time simulation
@@ -180,6 +181,14 @@ class VenomEngine:
         if self._time_offset:
             now = now + self._time_offset
         return now
+
+    def _log_event(self, event_type: str, **kwargs):
+        """Append a structured decision event for the daily journal."""
+        self._day_events.append({
+            "type": event_type,
+            "time": self._now().strftime("%H:%M:%S"),
+            **kwargs,
+        })
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -282,10 +291,22 @@ class VenomEngine:
             now_time = now.time()
             window = self.time_mgr.get_window(now_time)
 
-            # Read VIX from feed
+            # Read VIX from feed (smoothed to avoid regime flipping on noise)
             vix_ltp = self.feed.get_ltp(VIX_SECURITY_ID)
             if vix_ltp is not None:
-                self._vix = vix_ltp
+                smoothed = self.vix_gate.smooth(vix_ltp)
+                if smoothed != self._vix:
+                    self._vix = smoothed
+                    vix_m = self.vix_gate.get_mode(self._vix)
+                    self._log_event(
+                        "vix_check",
+                        vix=round(self._vix, 2),
+                        mode=vix_m.value,
+                        can_trade=self.vix_gate.can_trade(self._vix),
+                        size_mult=round(self.vix_gate.size_multiplier(self._vix), 2),
+                        min_confirms=self.vix_gate.min_confirmations(self._vix),
+                        target_delta=round(self.vix_gate.target_delta(self._vix), 2),
+                    )
 
             # Kill switch
             if self.kill_switch.is_triggered:
@@ -299,6 +320,22 @@ class VenomEngine:
 
             # After market close — stop
             if now_time >= dtime(15, 30):
+                reason = "Market closed"
+                if self._trade_count == 0:
+                    if not self.vix_gate.can_trade(self._vix):
+                        reason = "VIX blocked — sat out"
+                    elif not self._signal_detected and self._signal_attempt_done:
+                        reason = "No signal detected — sat out"
+                    elif not self._signal_detected:
+                        reason = "No signal detected — sat out"
+                    else:
+                        reason = "Confluence insufficient — sat out"
+                self._log_event(
+                    "day_end",
+                    reason=reason,
+                    daily_pnl=round(self._daily_pnl, 0),
+                    trades=self._trade_count,
+                )
                 logger.info("Market closed — stopping VENOM")
                 self._running = False
                 break
@@ -314,6 +351,7 @@ class VenomEngine:
                         <= now_time
                         < signal_end_time):
                     self._detect_ohlc_signal()
+                    self._signal_attempt_done = True  # Run once, not every tick
                 elif now_time >= signal_end_time:
                     # Late start — run signal detection from first candle
                     logger.info("Late start catch-up: running signal detection now")
@@ -387,43 +425,68 @@ class VenomEngine:
         """Run all gates before allowing an entry. Returns True if clear."""
         now_time = self._now().time()
 
+        gates: list[dict] = []
+
         # Time window
-        if not self.time_mgr.can_enter(now_time):
+        time_ok = self.time_mgr.can_enter(now_time)
+        gates.append({"name": "Time Window", "passed": time_ok, "value": now_time.strftime("%H:%M")})
+        if not time_ok:
             logger.info("Pre-entry blocked: outside entry window")
+            self._log_event("gate_check", gates=gates)
             return False
 
         # VIX gate
-        if not self.vix_gate.can_trade(self._vix):
+        vix_ok = self.vix_gate.can_trade(self._vix)
+        vix_mode = self.vix_gate.get_mode(self._vix).value
+        gates.append({"name": "VIX Gate", "passed": vix_ok, "value": f"{self._vix:.1f} ({vix_mode})"})
+        if not vix_ok:
             logger.info("Pre-entry blocked: VIX %.2f too high", self._vix)
+            self._log_event("gate_check", gates=gates)
             return False
 
         # Daily loss limit
-        if not self.monthly_mgr.can_trade_today(self._daily_pnl):
+        daily_ok = self.monthly_mgr.can_trade_today(self._daily_pnl)
+        gates.append({"name": "Daily Loss Limit", "passed": daily_ok, "value": f"{self._daily_pnl:+.0f}"})
+        if not daily_ok:
             logger.info("Pre-entry blocked: daily loss limit hit (%.2f)", self._daily_pnl)
+            self._log_event("gate_check", gates=gates)
             return False
 
         # Weekly loss limit
-        if not self.monthly_mgr.can_trade_this_week(self._weekly_pnl):
+        weekly_ok = self.monthly_mgr.can_trade_this_week(self._weekly_pnl)
+        gates.append({"name": "Weekly Loss Limit", "passed": weekly_ok, "value": f"{self._weekly_pnl:+.0f}"})
+        if not weekly_ok:
             logger.info("Pre-entry blocked: weekly loss limit hit (%.2f)", self._weekly_pnl)
+            self._log_event("gate_check", gates=gates)
             return False
 
         # Consecutive losses
-        if not self.monthly_mgr.can_trade_after_streak(self._consecutive_losses):
+        streak_ok = self.monthly_mgr.can_trade_after_streak(self._consecutive_losses)
+        gates.append({"name": "Loss Streak", "passed": streak_ok, "value": str(self._consecutive_losses)})
+        if not streak_ok:
             logger.info(
                 "Pre-entry blocked: %d consecutive losses",
                 self._consecutive_losses,
             )
+            self._log_event("gate_check", gates=gates)
             return False
 
         # Max trades per day
-        if self._trade_count >= self.vcfg.max_trades_per_day:
+        trades_ok = self._trade_count < self.vcfg.max_trades_per_day
+        gates.append({"name": "Max Trades", "passed": trades_ok, "value": f"{self._trade_count}/{self.vcfg.max_trades_per_day}"})
+        if not trades_ok:
             logger.info("Pre-entry blocked: max trades (%d) reached", self._trade_count)
+            self._log_event("gate_check", gates=gates)
             return False
 
         # Kill switch
-        if self.kill_switch.is_triggered:
+        kill_ok = not self.kill_switch.is_triggered
+        gates.append({"name": "Kill Switch", "passed": kill_ok, "value": "active" if not kill_ok else "clear"})
+        if not kill_ok:
+            self._log_event("gate_check", gates=gates)
             return False
 
+        self._log_event("gate_check", gates=gates)
         return True
 
     # ------------------------------------------------------------------
@@ -454,6 +517,10 @@ class VenomEngine:
             if idx_open <= 0:
                 return
 
+            # Refresh round-number S/R levels from today's open
+            if self._level_detector:
+                self._level_detector.update_round_levels(idx_open)
+
             # Get ATM option chain for CE/PE candles
             ce_ohlc = pe_ohlc = None
             try:
@@ -479,18 +546,38 @@ class VenomEngine:
                         if atm_ce and atm_pe:
                             ce_price = atm_ce.ltp or atm_ce.mid_price
                             pe_price = atm_pe.ltp or atm_pe.mid_price
-                            ce_ohlc = (ce_price, ce_price * 1.01, ce_price * 0.99, ce_price)
-                            pe_ohlc = (pe_price, pe_price * 1.01, pe_price * 0.99, pe_price)
+                            # Derive option OHLC from index move × delta
+                            delta = abs(getattr(atm_ce, "delta", 0.5)) or 0.5
+                            ce_move_h = (idx_high - idx_open) * delta
+                            ce_move_l = (idx_low - idx_open) * delta
+                            ce_move_c = (idx_close - idx_open) * delta
+                            ce_ohlc = (
+                                ce_price,
+                                ce_price + max(ce_move_h, 0),
+                                ce_price + min(ce_move_l, 0),
+                                ce_price + ce_move_c,
+                            )
+                            pe_move_h = (idx_open - idx_low) * delta
+                            pe_move_l = (idx_open - idx_high) * delta
+                            pe_move_c = (idx_open - idx_close) * delta
+                            pe_ohlc = (
+                                pe_price,
+                                pe_price + max(pe_move_h, 0),
+                                pe_price + min(pe_move_l, 0),
+                                pe_price + pe_move_c,
+                            )
             except Exception:
                 logger.debug("Option chain fetch failed, using simulated option patterns")
 
             # Fallback: simulate CE/PE patterns from index candle
+            _sig_source = "chain" if (ce_ohlc and pe_ohlc) else "simulated"
             if not ce_ohlc or not pe_ohlc:
                 from nifty_trader.backtest.simulator import PremiumSimulator
                 sim = PremiumSimulator()
                 opts = sim.simulate_option_ohlc_from_index(idx_open, idx_high, idx_low, idx_close)
                 ce_ohlc = (opts["ce_open"], opts["ce_high"], opts["ce_low"], opts["ce_close"])
                 pe_ohlc = (opts["pe_open"], opts["pe_high"], opts["pe_low"], opts["pe_close"])
+                _sig_source = "simulated"
                 logger.info("Using simulated option patterns for O=H/O=L detection")
 
             sig = self.ohlc_detector.detect(
@@ -510,6 +597,19 @@ class VenomEngine:
 
             self._ohlc_signal_text = f"{sig.signal_type.value}: {sig.reason}"
             logger.info("OHLC signal: %s", self._ohlc_signal_text)
+
+            self._log_event(
+                "signal_detection",
+                signal=sig.signal_type.value,
+                index_pattern=getattr(sig, "index_pattern", ""),
+                ce_pattern=getattr(sig, "ce_pattern", ""),
+                pe_pattern=getattr(sig, "pe_pattern", ""),
+                reason=sig.reason,
+                index_ohlc=[round(idx_open, 1), round(idx_high, 1), round(idx_low, 1), round(idx_close, 1)],
+                ce_ohlc=[round(v, 2) for v in ce_ohlc],
+                pe_ohlc=[round(v, 2) for v in pe_ohlc],
+                source=_sig_source,
+            )
 
             if sig.signal_type in (SignalType.BUY_CE, SignalType.BUY_PE):
                 self._signal_detected = True
@@ -544,16 +644,46 @@ class VenomEngine:
         if intraday_df is not None and not intraday_df.empty and self._level_detector:
             result = evaluate_confluence(intraday_df, self._level_detector, self.cfg.strategy)
 
-            # VIX-adjusted threshold
+            # VIX-adjusted threshold: use weighted score, not just count
             min_confirms = self.vix_gate.min_confirmations(self._vix)
-            active_signals = sum(
+            min_score = self.cfg.strategy.confluence_min_score
+
+            # Weighted score for the target direction
+            weights = self.cfg.strategy.signal_weights
+            dir_score = sum(
+                weights.get(s.name, 0.5) * s.strength
+                for s in result.signals
+                if s.direction == direction
+            )
+            active_count = sum(
                 1 for s in result.signals
                 if s.direction == direction
             )
-            if active_signals < min_confirms:
+
+            conf_signals = [
+                {
+                    "name": s.name,
+                    "direction": s.direction.value if hasattr(s.direction, "value") else str(s.direction),
+                    "strength": getattr(s, "strength", 1.0),
+                    "reason": getattr(s, "reason", ""),
+                }
+                for s in result.signals
+            ]
+            passed = active_count >= min_confirms and dir_score >= min_score
+            self._log_event(
+                "confluence",
+                signals=conf_signals,
+                total_score=round(dir_score, 2),
+                active_count=active_count,
+                threshold=min_confirms,
+                min_score=min_score,
+                passed=passed,
+            )
+
+            if not passed:
                 logger.info(
-                    "Confluence insufficient: %d/%d confirmations",
-                    active_signals, min_confirms,
+                    "Confluence insufficient: %d/%d confirms, score %.2f/%.2f",
+                    active_count, min_confirms, dir_score, min_score,
                 )
                 return
 
@@ -648,6 +778,17 @@ class VenomEngine:
         self._trail_state = trail_state
         self._signal_detected = False  # Consumed
 
+        self._log_event(
+            "trade_entry",
+            direction=direction.value,
+            strike=contract.strike_price,
+            expiry=str(expiry),
+            premium=round(premium, 2),
+            quantity=adjusted_qty,
+            sl_price=round(trail_state.sl_price, 2),
+            delta=round(target_delta, 2),
+        )
+
         self.notifier.trade_entry(
             f"VENOM {contract.option_type.value} {contract.strike_price:.0f} "
             f"{expiry} @ {premium:.2f} qty={adjusted_qty} "
@@ -676,12 +817,34 @@ class VenomEngine:
             action = self.trail_engine.update(self._trail_state, ltp)
 
             if action == "SL_HIT":
+                self._log_event(
+                    "trail_update", action="SL_HIT",
+                    sl_price=round(self._trail_state.sl_price, 2),
+                    peak_price=round(self._trail_state.peak_price, 2),
+                    gain_pct=round(((self._trail_state.peak_price - self._trail_state.entry_price) / self._trail_state.entry_price) * 100, 1) if self._trail_state.entry_price else 0,
+                    risk_free=self._trail_state.risk_free,
+                )
                 self._exit_position(ltp, "Trailing SL hit")
                 return
             if action == "EXIT_MAX_PROFIT":
+                self._log_event(
+                    "trail_update", action="EXIT_MAX_PROFIT",
+                    sl_price=round(self._trail_state.sl_price, 2),
+                    peak_price=round(self._trail_state.peak_price, 2),
+                    gain_pct=round(((ltp - self._trail_state.entry_price) / self._trail_state.entry_price) * 100, 1) if self._trail_state.entry_price else 0,
+                    risk_free=self._trail_state.risk_free,
+                )
                 self._exit_position(ltp, "Max profit target hit")
                 return
             if action in ("MOVE_SL_TO_COST", "LOCK_PROFIT", "TRAILING"):
+                self._log_event(
+                    "trail_update", action=action,
+                    sl_price=round(self._trail_state.sl_price, 2),
+                    peak_price=round(self._trail_state.peak_price, 2),
+                    gain_pct=round(((ltp - self._trail_state.entry_price) / self._trail_state.entry_price) * 100, 1) if self._trail_state.entry_price else 0,
+                    rung_hit=list(self._trail_state.rungs_hit) if hasattr(self._trail_state, "rungs_hit") else [],
+                    risk_free=self._trail_state.risk_free,
+                )
                 # Modify the broker SL order
                 if self._sl_order_id:
                     self.order_mgr.modify_sl_trigger(
@@ -697,6 +860,13 @@ class VenomEngine:
         if ctx.entry_time and ctx.entry_price > 0:
             pnl_pct = ((ltp - ctx.entry_price) / ctx.entry_price) * 100
             if self.time_mgr.time_stop_hit(ctx.entry_time, now, pnl_pct):
+                minutes_held = (now - ctx.entry_time).total_seconds() / 60
+                self._log_event(
+                    "time_stop",
+                    minutes_held=round(minutes_held, 1),
+                    pnl_pct=round(pnl_pct, 1),
+                    triggered=True,
+                )
                 self._exit_position(ltp, f"Time stop (flat {pnl_pct:+.1f}%)")
                 return
 
@@ -712,6 +882,16 @@ class VenomEngine:
 
     def _exit_position(self, exit_price: float, reason: str):
         ctx = self.fsm.ctx
+
+        self._log_event(
+            "trade_exit",
+            exit_price=round(exit_price, 2),
+            pnl=round((exit_price - ctx.entry_price) * ctx.quantity, 0) if ctx.entry_price else 0,
+            exit_reason=reason,
+            rungs_hit=list(self._trail_state.rungs_hit) if self._trail_state and hasattr(self._trail_state, "rungs_hit") else [],
+            peak_premium=round(self._trail_state.peak_price, 2) if self._trail_state else 0,
+        )
+
         self.fsm.start_exit(reason)
 
         if not self.cfg.paper_mode:

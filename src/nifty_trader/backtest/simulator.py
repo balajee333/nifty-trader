@@ -35,10 +35,12 @@ class PremiumSimulator:
         scaling_factor: float = 0.4,
         atm_delta: float = 0.50,
         min_premium: float = 5.0,
+        slippage_pct: float = 0.5,
     ):
         self._scaling = scaling_factor
         self._delta = atm_delta
         self._min_premium = min_premium
+        self._slippage_pct = slippage_pct  # bid-ask spread cost per side
 
     def estimate_base_premium(
         self, spot: float, vix: float, dte: float = 5.0,
@@ -126,23 +128,28 @@ class PremiumSimulator:
         base_spot = first["open"]
         base_premium = self.estimate_base_premium(base_spot, vix, dte)
 
+        # Approximate theta decay: ~3% of premium per trading day for weeklies
+        # Spread across trading minutes (375 min/day = 9:15-15:30)
+        theta_per_min = base_premium * 0.03 / 375.0
+
         result = []
-        for candle in candles:
+        for i, candle in enumerate(candles):
+            # Time decay based on candle index (5-min intervals)
+            decay = theta_per_min * 5.0 * i
+
             if direction == "BULLISH":
-                # CE premium tracks index positively
                 move = (candle["close"] - base_spot) * self._delta
-                premium = base_premium + move
+                premium = base_premium + move - decay
             else:
-                # PE premium tracks index inversely
                 move = (base_spot - candle["close"]) * self._delta
-                premium = base_premium + move
+                premium = base_premium + move - decay
 
             premium = max(premium, self._min_premium)
 
             result.append(SimulatedPremium(
                 timestamp=str(candle.get("timestamp", "")),
-                ce_premium=base_premium + (candle["close"] - base_spot) * self._delta,
-                pe_premium=base_premium + (base_spot - candle["close"]) * self._delta,
+                ce_premium=max(base_premium + (candle["close"] - base_spot) * self._delta - decay, self._min_premium),
+                pe_premium=max(base_premium + (base_spot - candle["close"]) * self._delta - decay, self._min_premium),
                 delta=self._delta,
             ))
 
@@ -151,8 +158,10 @@ class PremiumSimulator:
     def get_entry_premium(
         self, spot: float, vix: float, dte: float = 5.0,
     ) -> float:
-        """Get the entry premium for position sizing."""
-        return self.estimate_base_premium(spot, vix, dte)
+        """Get the entry premium for position sizing (includes slippage)."""
+        base = self.estimate_base_premium(spot, vix, dte)
+        # Entry pays the ask — add slippage
+        return base * (1 + self._slippage_pct / 100)
 
     def premium_at_index_price(
         self,

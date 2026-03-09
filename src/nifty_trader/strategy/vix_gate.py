@@ -15,7 +15,13 @@ class VixMode(Enum):
 
 class VixGate:
     """Maps the current India VIX reading to a risk regime and adjusts
-    position sizing, confirmation requirements, and delta targets."""
+    position sizing, confirmation requirements, and delta targets.
+
+    VIX smoothing: uses a simple moving average over recent readings to
+    avoid regime flipping on tick-to-tick noise.
+    """
+
+    _VIX_SMOOTH_WINDOW = 10  # number of readings to average
 
     def __init__(
         self,
@@ -32,6 +38,14 @@ class VixGate:
         self._blocked = blocked
         self._delta_low = delta_low
         self._delta_high = delta_high
+        self._vix_history: list[float] = []
+
+    def smooth(self, raw_vix: float) -> float:
+        """Feed a raw VIX reading and return the smoothed (SMA) value."""
+        self._vix_history.append(raw_vix)
+        if len(self._vix_history) > self._VIX_SMOOTH_WINDOW:
+            self._vix_history = self._vix_history[-self._VIX_SMOOTH_WINDOW:]
+        return sum(self._vix_history) / len(self._vix_history)
 
     def get_mode(self, vix: float) -> VixMode:
         """Classify VIX into a trading mode."""
@@ -50,21 +64,25 @@ class VixGate:
         return self.get_mode(vix) != VixMode.BLOCKED
 
     def size_multiplier(self, vix: float) -> float:
-        """Return position-size multiplier (0.0–1.0) based on VIX regime."""
-        mode = self.get_mode(vix)
-        if mode == VixMode.BLOCKED:
+        """Return position-size multiplier (0.0–1.0), linearly interpolated.
+
+        Full size at VIX <= full threshold, zero at VIX >= blocked threshold,
+        smooth linear ramp in between.
+        """
+        if vix >= self._blocked:
             return 0.0
-        if mode in (VixMode.CAUTION, VixMode.RESTRICTED):
-            return 0.5
-        return 1.0
+        if vix <= self._full:
+            return 1.0
+        # Linear interpolation: 1.0 at _full → 0.0 at _blocked
+        return round(max(0.0, 1.0 - (vix - self._full) / (self._blocked - self._full)), 2)
 
     def min_confirmations(self, vix: float) -> int:
         """Higher VIX → more confirmations required before entry."""
         mode = self.get_mode(vix)
-        if mode in (VixMode.SELECTIVE, VixMode.RESTRICTED):
+        if mode in (VixMode.CAUTION, VixMode.SELECTIVE, VixMode.RESTRICTED):
             return 4
         return 3
 
     def target_delta(self, vix: float) -> float:
-        """Higher VIX → deeper ITM strikes (higher delta)."""
-        return self._delta_high if vix >= self._selective else self._delta_low
+        """Higher VIX → safer OTM strikes (lower delta) to reduce vega risk."""
+        return self._delta_low if vix >= self._selective else self._delta_high

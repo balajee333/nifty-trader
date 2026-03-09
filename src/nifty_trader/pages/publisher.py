@@ -133,6 +133,15 @@ class JournalPublisher:
             elif signal in ("wait", "no_trade", "none"):
                 skip_reason = "No signal"
 
+        # Collect decision events from engine
+        events = list(getattr(engine, "_day_events", []))
+
+        # Extract confluence score from events (if available)
+        confluence_score = 0
+        for ev in events:
+            if ev.get("type") == "confluence":
+                confluence_score = ev.get("total_score", 0)
+
         self._day_data = {
             "date": today,
             "nifty_open": round(nifty_open, 1),
@@ -143,13 +152,14 @@ class JournalPublisher:
             "signal": signal,
             "signal_detail": signal_detail,
             "index_ohlc": index_ohlc,
-            "confluence_score": 0,  # not easily available at shutdown
-            "day_type": "unknown",
+            "confluence_score": confluence_score,
+            "day_type": self._classify_day(nifty_open, nifty_close, index_ohlc),
             "trades": trades_data,
             "daily_pnl": round(daily_pnl, 0),
             "trade_count": trade_count,
             "system_health": system_health,
             "skip_reason": skip_reason,
+            "events": events,
         }
 
         logger.info(
@@ -160,6 +170,24 @@ class JournalPublisher:
             trade_count,
         )
         return self._day_data
+
+    @staticmethod
+    def _classify_day(
+        nifty_open: float, nifty_close: float, ohlc: dict | None,
+    ) -> str:
+        """Classify trading day from OHLC data."""
+        if not ohlc or nifty_open <= 0:
+            return "unknown"
+        high = ohlc.get("h", 0)
+        low = ohlc.get("l", 0)
+        day_range = high - low
+        if day_range <= 0:
+            return "unknown"
+        body = abs(nifty_close - nifty_open)
+        body_ratio = body / day_range
+        if body_ratio > 0.5:
+            return "trending_bullish" if nifty_close > nifty_open else "trending_bearish"
+        return "choppy"
 
     def publish(self):
         """Clone gh-pages, merge today's data, regenerate index.html, push."""

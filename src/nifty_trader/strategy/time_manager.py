@@ -28,8 +28,8 @@ class TimeManager:
             (time(8, 45), time(9, 15), TradingWindow.PRE_MARKET),
             (time(9, 15), time(9, 21), TradingWindow.SIGNAL_DETECTION),
             (time(9, 21), time(10, 15), TradingWindow.PRIME_ENTRY),
-            (time(10, 15), time(11, 30), TradingWindow.MORNING_ENTRY),
-            (time(11, 30), time(13, 30), TradingWindow.NO_TRADE),
+            (time(10, 15), time(11, 15), TradingWindow.MORNING_ENTRY),
+            (time(11, 15), time(13, 30), TradingWindow.NO_TRADE),
             (time(13, 30), time(14, 30), TradingWindow.AFTERNOON_ENTRY),
             (time(14, 30), time(15, 15), TradingWindow.CLOSING),
             (time(15, 15), time(15, 30), TradingWindow.MARKET_CLOSE),
@@ -66,9 +66,11 @@ class TimeManager:
 
         A position is time-stopped if it has been held for longer than
         ``time_stop_minutes`` and the P&L is still near flat (< 5 %).
-        Positions already showing decent profit (> 15 %) are exempt.
+        Positions showing decent profit (> 8 %) are exempt.
         """
-        if pnl_pct > 15.0:
+        if entry_time > now:
+            return False
+        if pnl_pct > 8.0:
             return False
         elapsed = (now - entry_time).total_seconds() / 60
         return elapsed >= self.time_stop_minutes and abs(pnl_pct) < 5.0

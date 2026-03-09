@@ -118,7 +118,7 @@ body {
   transition: max-height .4s ease, opacity .3s ease;
   opacity: 0;
 }
-.detail-row.open { max-height: 2000px; opacity: 1; }
+.detail-row.open { max-height: 5000px; opacity: 1; }
 .detail-card {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 20px; margin: 4px 0 10px; box-shadow: var(--shadow);
@@ -194,6 +194,51 @@ body {
   width: 14px; height: 8px; border-radius: 2px; background: rgba(255,255,255,.1);
 }
 .conf-seg.filled { background: var(--green); }
+
+/* ---- Decision Trail ---- */
+.decision-trail { position: relative; padding-left: 28px; }
+.dt-event {
+  position: relative; margin-bottom: 10px; padding: 8px 12px;
+  background: rgba(255,255,255,.02); border-radius: 6px;
+  border: 1px solid var(--border); font-size: .82rem;
+  transition: background .2s;
+}
+.dt-event:hover { background: rgba(255,255,255,.05); }
+.dt-event::before {
+  content: ''; position: absolute; left: -22px; top: 14px;
+  width: 10px; height: 10px; border-radius: 50%;
+}
+.dt-event::after {
+  content: ''; position: absolute; left: -17px; top: 24px;
+  width: 1px; height: calc(100% + 2px); background: rgba(255,255,255,.08);
+}
+.dt-event:last-child::after { display: none; }
+.dt-event.dt-pass::before { background: var(--green); }
+.dt-event.dt-fail::before { background: var(--red); }
+.dt-event.dt-info::before { background: var(--blue); }
+.dt-event.dt-trade::before { background: var(--gold); }
+.dt-time { color: var(--text-dim); font-family: monospace; font-size: .75rem; margin-right: 8px; }
+.dt-type { font-weight: 700; text-transform: uppercase; font-size: .72rem; letter-spacing: .5px; margin-right: 8px; }
+.dt-detail { color: var(--text); }
+.dt-gates { list-style: none; padding: 4px 0 0; }
+.dt-gates li { padding: 2px 0; font-size: .8rem; }
+.dt-gates .gate-pass { color: var(--green); }
+.dt-gates .gate-fail { color: var(--red); }
+.dt-conf-signals { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.dt-conf-sig {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 2px 8px; border-radius: 10px; font-size: .72rem; font-weight: 600;
+  background: rgba(255,255,255,.05); border: 1px solid var(--border);
+}
+.dt-conf-sig.bullish { color: var(--green); border-color: rgba(0,255,136,.2); }
+.dt-conf-sig.bearish { color: var(--red); border-color: rgba(255,68,102,.2); }
+.dt-expand {
+  cursor: pointer; color: var(--text-dim); font-size: .72rem; margin-top: 4px;
+  display: inline-block; user-select: none;
+}
+.dt-expand:hover { color: var(--text); }
+.dt-raw { display: none; margin-top: 6px; padding: 6px 8px; background: rgba(0,0,0,.3); border-radius: 4px; font-family: monospace; font-size: .72rem; color: var(--text-dim); white-space: pre-wrap; word-break: break-all; }
+.dt-raw.open { display: block; }
 
 /* ---- Day Summary ---- */
 .day-summary-pnl { font-size: 1.6rem; font-weight: 700; }
@@ -276,6 +321,48 @@ function rungDots(hits) {
   let h = '<span class="rungs">';
   for (const l of levels) h += '<span class="rung'+(s.has(l) ? ' hit' : '')+'" title="'+l+'%"></span>';
   return h + '</span>';
+}
+
+// Decision trail helpers
+function dtEventClass(ev) {
+  const t = ev.type;
+  if (t === 'trade_entry' || t === 'trade_exit') return 'dt-trade';
+  if (t === 'gate_check') {
+    const allPass = (ev.gates || []).every(g => g.passed);
+    return allPass ? 'dt-pass' : 'dt-fail';
+  }
+  if (t === 'confluence') return ev.passed ? 'dt-pass' : 'dt-fail';
+  if (t === 'vix_check') return ev.can_trade ? 'dt-info' : 'dt-fail';
+  if (t === 'signal_detection') {
+    const s = (ev.signal || '').toLowerCase();
+    if (s === 'buy_ce' || s === 'buy_pe') return 'dt-pass';
+    if (s === 'no_trade') return 'dt-fail';
+    return 'dt-info';
+  }
+  if (t === 'trail_update') {
+    if (ev.action === 'SL_HIT') return 'dt-fail';
+    return 'dt-pass';
+  }
+  if (t === 'time_stop') return ev.triggered ? 'dt-fail' : 'dt-info';
+  if (t === 'day_end') return 'dt-info';
+  return 'dt-info';
+}
+function dtSummary(ev) {
+  const t = ev.type;
+  if (t === 'vix_check') return 'VIX '+fmt(ev.vix,1)+' \u2014 mode: <b>'+ev.mode+'</b>, trade: '+(ev.can_trade?'\u2713':'\u2717')+', size: '+ev.size_mult+'x, confirms: '+ev.min_confirms+', delta: '+ev.target_delta;
+  if (t === 'signal_detection') return signalBadge(ev.signal)+' '+(ev.reason||'')+' <span style="color:var(--text-dim)">('+ev.source+')</span>';
+  if (t === 'gate_check') {
+    const passed = (ev.gates||[]).filter(g=>g.passed).length;
+    const total = (ev.gates||[]).length;
+    return passed === total ? 'All '+total+' gates passed' : passed+'/'+total+' gates passed';
+  }
+  if (t === 'confluence') return 'Score: '+ev.active_count+'/'+ev.threshold+' '+(ev.passed?'\u2713 passed':'\u2717 insufficient');
+  if (t === 'trade_entry') return (ev.direction||'')+' '+fmt(ev.strike)+' @ '+fmt(ev.premium,2)+' qty='+ev.quantity+' SL='+fmt(ev.sl_price,2);
+  if (t === 'trail_update') return ev.action+' \u2014 SL: '+fmt(ev.sl_price,2)+' Peak: '+fmt(ev.peak_price,2)+' Gain: '+fmt(ev.gain_pct,1)+'%'+(ev.risk_free?' [RISK-FREE]':'');
+  if (t === 'trade_exit') return exitBadge(ev.exit_reason)+' @ '+fmt(ev.exit_price,2)+' P&L: <b style="color:'+pnlColor(ev.pnl)+'">'+(ev.pnl>=0?'+':'')+fmt(ev.pnl)+'</b>';
+  if (t === 'time_stop') return 'Held '+fmt(ev.minutes_held,0)+'min, P&L: '+fmt(ev.pnl_pct,1)+'% \u2014 '+(ev.triggered?'triggered':'within range');
+  if (t === 'day_end') return ev.reason+' \u2014 P&L: '+(ev.daily_pnl>=0?'+':'')+fmt(ev.daily_pnl)+', Trades: '+ev.trades;
+  return JSON.stringify(ev);
 }
 
 // Build date index
@@ -504,7 +591,48 @@ function renderDetail(d) {
     h += '</div>';
   }
 
-  // Section 3: Trades
+  // Section 3: Decision Trail
+  if (d.events && d.events.length > 0) {
+    h += '<h3>Decision Trail</h3>';
+    h += '<div class="decision-trail">';
+    d.events.forEach((ev, ei) => {
+      const cls = dtEventClass(ev);
+      h += '<div class="dt-event '+cls+'">';
+      h += '<span class="dt-time">['+ev.time+']</span>';
+      h += '<span class="dt-type">'+ev.type.replace('_',' ')+'</span>';
+      h += '<span class="dt-detail">'+dtSummary(ev)+'</span>';
+      // Gate checks as checklist
+      if (ev.type === 'gate_check' && ev.gates) {
+        h += '<ul class="dt-gates">';
+        ev.gates.forEach(g => {
+          const icon = g.passed ? '\u2713' : '\u2717';
+          const gcls = g.passed ? 'gate-pass' : 'gate-fail';
+          h += '<li class="'+gcls+'">'+icon+' '+g.name+' <span style="color:var(--text-dim)">'+g.value+'</span>';
+          if (g.reason) h += ' \u2014 '+g.reason;
+          h += '</li>';
+        });
+        h += '</ul>';
+      }
+      // Confluence signals as badges
+      if (ev.type === 'confluence' && ev.signals) {
+        h += '<div class="dt-conf-signals">';
+        ev.signals.forEach(s => {
+          const dir = (s.direction||'').toLowerCase();
+          const dcls = dir === 'bullish' ? 'bullish' : dir === 'bearish' ? 'bearish' : '';
+          const arrow = dir === 'bullish' ? '\u25B2' : dir === 'bearish' ? '\u25BC' : '\u25CF';
+          h += '<span class="dt-conf-sig '+dcls+'">'+arrow+' '+s.name+'</span>';
+        });
+        h += '</div>';
+      }
+      // Collapsible raw data
+      h += '<span class="dt-expand" onclick="this.nextElementSibling.classList.toggle(\'open\')">\u25B6 raw</span>';
+      h += '<div class="dt-raw">'+JSON.stringify(ev, null, 2)+'</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // Section 4: Trades
   if (d.trades && d.trades.length > 0) {
     h += '<h3>Trades</h3>';
     d.trades.forEach(t => {

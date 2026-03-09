@@ -45,13 +45,21 @@ class MarketFeedManager:
         self._ws_thread: threading.Thread | None = None
         self._subscriptions: list[tuple[int, str, int]] = []  # (exchange_code, security_id, feed_type)
         self._latest_ltp: dict[str, float] = {}
+        self._ltp_timestamp: dict[str, float] = {}  # security_id → monotonic time
+        self._LTP_STALE_SEC = 30  # reject LTP older than this
 
     @property
     def latest_ltp(self) -> dict[str, float]:
         return self._latest_ltp
 
     def get_ltp(self, security_id: str) -> float | None:
-        return self._latest_ltp.get(security_id)
+        ltp = self._latest_ltp.get(security_id)
+        if ltp is None:
+            return None
+        ts = self._ltp_timestamp.get(security_id, 0)
+        if time.monotonic() - ts > self._LTP_STALE_SEC:
+            return None  # stale — force REST fallback
+        return ltp
 
     def subscribe_nifty_spot(self):
         """Subscribe to NIFTY 50 index quote (backward-compat wrapper)."""
@@ -157,6 +165,7 @@ class MarketFeedManager:
             ltp = message.get("LTP", message.get("ltp", 0))
             if sec_id and ltp:
                 self._latest_ltp[sec_id] = float(ltp)
+                self._ltp_timestamp[sec_id] = time.monotonic()
                 if self._on_tick:
                     self._on_tick(message)
         elif isinstance(message, list):

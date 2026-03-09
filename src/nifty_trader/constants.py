@@ -5,7 +5,7 @@ from enum import Enum
 # NIFTY 50 Index
 NIFTY_SECURITY_ID = "13"
 NIFTY_EXCHANGE_SEGMENT = "IDX_I"
-NIFTY_LOT_SIZE = 25
+NIFTY_LOT_SIZE = 75
 
 # DhanHQ exchange segments
 class ExchangeSegment(str, Enum):

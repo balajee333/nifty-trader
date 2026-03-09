@@ -67,10 +67,21 @@ class LevelDetector:
         above = self.resistances_above(price)
         return above[0] if above else None
 
-    def is_near_support(self, price: float, threshold_pct: float = 0.3) -> bool:
+    def is_near_support(self, price: float, threshold_pct: float = 0.5) -> bool:
         sup = self.nearest_support(price)
         return sup is not None and sup.distance_pct(price) <= threshold_pct
 
-    def is_near_resistance(self, price: float, threshold_pct: float = 0.3) -> bool:
+    def is_near_resistance(self, price: float, threshold_pct: float = 0.5) -> bool:
         res = self.nearest_resistance(price)
         return res is not None and res.distance_pct(price) <= threshold_pct
+
+    def update_round_levels(self, current_price: float):
+        """Recompute round-number levels from current price (e.g. today's open).
+
+        Replaces stale round levels computed from yesterday's close.
+        """
+        self._levels = [l for l in self._levels if l.kind != "round"]
+        rounds = round_number_levels(current_price)
+        for price in rounds:
+            self._levels.append(Level(price=price, kind="round"))
+        self._levels.sort(key=lambda l: l.price)
